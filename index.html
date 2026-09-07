@@ -4,26 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>🔴 LIVE – TCC Marketplace</title>
-  <link rel="icon" type="image/png" href="https://i.ibb.co/7dNgfK3t/TCC-Marketplace-Logo.png">
-<link rel="apple-touch-icon" href="https://i.ibb.co/7dNgfK3t/TCC-Marketplace-Logo.png">
-<meta name="theme-color" content="#0B0E11">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="TCC Market">
-
-<!-- ── Open Graph / Social ── -->
-<meta property="og:title" content="TCC Marketplace — USDT Platform">
-<meta property="og:description" content="ซื้อขายสินค้าด้วย USDT รับ Funding Free ทุกการสั่งซื้อ พร้อมระบบ Referral Commission อัตโนมัติ">
-<meta property="og:image" content="https://i.ibb.co/7Ny5bGnQ/Share-Card.png">
-<meta property="og:image:width" content="1456">
-<meta property="og:image:height" content="816">
-<meta property="og:image:alt" content="TCC Marketplace — Funding Fee Platform">
-<meta property="og:type" content="website">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="TCC Marketplace — USDT Platform">
-<meta name="twitter:description" content="ซื้อขายสินค้าด้วย USDT รับ Funding Free ทุกการสั่งซื้อ พร้อมระบบ Referral Commission อัตโนมัติ">
-<meta name="twitter:image" content="https://i.ibb.co/7Ny5bGnQ/Share-Card.png">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
@@ -799,6 +779,7 @@ let shareCount = 312;
 let muted = true;
 let db = null;
 let streamLive = false;
+let hlsInstance = null; // track HLS instance for clean re-init
 
 // ─────────────────────────────────────────
 // HLS PLAYER
@@ -808,25 +789,30 @@ function initPlayer() {
   const offline = document.getElementById('offlineScreen');
 
   if (!CONFIG.hlsUrl) {
-    // demo mode – show offline screen
     offline.style.display = 'flex';
     return;
+  }
+
+  // destroy existing HLS instance before re-init
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
   }
 
   offline.style.display = 'none';
   streamLive = true;
 
   if (Hls.isSupported()) {
-    const hls = new Hls({ lowLatencyMode: true });
-    hls.loadSource(CONFIG.hlsUrl);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
-    hls.on(Hls.Events.ERROR, (e, data) => {
+    hlsInstance = new Hls({ lowLatencyMode: true });
+    hlsInstance.loadSource(CONFIG.hlsUrl);
+    hlsInstance.attachMedia(video);
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); });
+    hlsInstance.on(Hls.Events.ERROR, (e, data) => {
       if (data.fatal) { offline.style.display = 'flex'; streamLive = false; }
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = CONFIG.hlsUrl;
-    video.play();
+    video.play().catch(()=>{});
   }
 }
 
@@ -861,6 +847,13 @@ function initFirebase() {
       if (d.likes) { likeCount = d.likes; updateLikeUI(); }
       if (d.shares) { shareCount = d.shares; updateShareUI(); }
       if (d.viewers) document.getElementById('viewerCount').textContent = d.viewers.toLocaleString();
+      // แสดง/ซ่อน offline screen ตาม isLive
+      const offline = document.getElementById('offlineScreen');
+      if (d.isLive === false) {
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        streamLive = false;
+        if (offline) offline.style.display = 'flex';
+      }
     });
     // ─── อ่าน streamInfo จาก Admin → อัปเดต HLS URL + title อัตโนมัติ ───
     db.ref('streamInfo').on('value', snap => {
@@ -874,8 +867,8 @@ function initFirebase() {
         const el = document.getElementById('streamSub');
         if (el) el.textContent = info.desc;
       }
-      // ถ้ามี hlsUrl ใหม่ และยังไม่ได้เล่น → เริ่ม player
-      if (info.hlsUrl && info.hlsUrl !== CONFIG.hlsUrl) {
+      // อัปเดต hlsUrl และเริ่ม player (ทุกครั้งที่ข้อมูลเปลี่ยน)
+      if (info.hlsUrl) {
         CONFIG.hlsUrl = info.hlsUrl;
         initPlayer();
       }
