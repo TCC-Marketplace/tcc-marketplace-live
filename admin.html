@@ -649,6 +649,13 @@ function initFirebase() {
       const d = snap.val() || {};
       updateStats(d);
     });
+    // โหลด streamInfo กลับมาแสดงใน input
+    db.ref('streamInfo').once('value', snap => {
+      const info = snap.val() || {};
+      if (info.title) document.getElementById('streamTitleInput').value = info.title;
+      if (info.desc)  document.getElementById('streamDescInput').value  = info.desc;
+      if (info.hlsUrl) document.getElementById('hlsUrlInput').value = info.hlsUrl;
+    });
     addLog('🔥 เชื่อมต่อ Firebase สำเร็จ');
   } catch(e) { initDemo(); }
 }
@@ -918,10 +925,11 @@ function clearPinnedMsg() {
 function saveSettings() {
   const title = document.getElementById('streamTitleInput').value;
   const desc = document.getElementById('streamDescInput').value;
+  const hlsUrl = document.getElementById('hlsUrlInput').value.trim();
   if (db) {
-    db.ref('streamInfo').set({ title, desc });
+    db.ref('streamInfo').set({ title, desc, hlsUrl });
   }
-  addLog('💾 บันทึกการตั้งค่าแล้ว');
+  addLog('💾 บันทึกการตั้งค่าแล้ว' + (hlsUrl ? ' (HLS: ' + hlsUrl.slice(0,40) + '...)' : ''));
   showToast('💾 บันทึกสำเร็จ');
 }
 
