@@ -4,26 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>⚙️ Admin – TCC Live Control</title>
-  <link rel="icon" type="image/png" href="https://i.ibb.co/7dNgfK3t/TCC-Marketplace-Logo.png">
-<link rel="apple-touch-icon" href="https://i.ibb.co/7dNgfK3t/TCC-Marketplace-Logo.png">
-<meta name="theme-color" content="#0B0E11">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="TCC Market">
-
-<!-- ── Open Graph / Social ── -->
-<meta property="og:title" content="TCC Marketplace — USDT Platform">
-<meta property="og:description" content="ซื้อขายสินค้าด้วย USDT รับ Funding Free ทุกการสั่งซื้อ พร้อมระบบ Referral Commission อัตโนมัติ">
-<meta property="og:image" content="https://i.ibb.co/7Ny5bGnQ/Share-Card.png">
-<meta property="og:image:width" content="1456">
-<meta property="og:image:height" content="816">
-<meta property="og:image:alt" content="TCC Marketplace — Funding Fee Platform">
-<meta property="og:type" content="website">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="TCC Marketplace — USDT Platform">
-<meta name="twitter:description" content="ซื้อขายสินค้าด้วย USDT รับ Funding Free ทุกการสั่งซื้อ พร้อมระบบ Referral Commission อัตโนมัติ">
-<meta name="twitter:image" content="https://i.ibb.co/7Ny5bGnQ/Share-Card.png">
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <style>
@@ -742,7 +722,14 @@ function startStream() {
   document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
   document.getElementById('goLiveBtn').classList.add('streaming');
   streamTimer = setInterval(updateDuration, 1000);
-  if (db) db.ref('liveStats/isLive').set(true);
+  if (db) {
+    const hlsUrl = document.getElementById('hlsUrlInput').value.trim();
+    const title = document.getElementById('streamTitleInput').value;
+    const desc = document.getElementById('streamDescInput').value;
+    db.ref('liveStats/isLive').set(true);
+    // push streamInfo so viewer auto-starts player
+    if (hlsUrl) db.ref('streamInfo').set({ title, desc, hlsUrl });
+  }
   addLog('🔴 เริ่ม Live Stream แล้ว');
   showToast('🔴 เริ่ม Live สำเร็จ!');
   sendSystemMsg('🔴 Live เริ่มแล้ว! ยินดีต้อนรับทุกคน 🎉');
@@ -761,7 +748,11 @@ function endStream() {
   document.getElementById('streamDuration').textContent = '';
   document.getElementById('goLiveBtn').textContent = '🔴 เริ่ม Live';
   document.getElementById('goLiveBtn').classList.remove('streaming');
-  if (db) db.ref('liveStats/isLive').set(false);
+  if (db) {
+    db.ref('liveStats/isLive').set(false);
+    // clear hlsUrl so viewer shows offline screen
+    db.ref('streamInfo/hlsUrl').remove();
+  }
   addLog('⏹ หยุด Live Stream แล้ว');
   showToast('⏹ หยุด Live แล้ว');
 }
