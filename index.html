@@ -842,6 +842,24 @@ function initFirebase() {
       if (d.shares) { shareCount = d.shares; updateShareUI(); }
       if (d.viewers) document.getElementById('viewerCount').textContent = d.viewers.toLocaleString();
     });
+    // ─── อ่าน streamInfo จาก Admin → อัปเดต HLS URL + title อัตโนมัติ ───
+    db.ref('streamInfo').on('value', snap => {
+      const info = snap.val() || {};
+      // อัปเดต title / desc บนหน้า
+      if (info.title) {
+        const el = document.getElementById('streamTitle');
+        if (el) el.textContent = info.title;
+      }
+      if (info.desc) {
+        const el = document.getElementById('streamSub');
+        if (el) el.textContent = info.desc;
+      }
+      // ถ้ามี hlsUrl ใหม่ และยังไม่ได้เล่น → เริ่ม player
+      if (info.hlsUrl && info.hlsUrl !== CONFIG.hlsUrl) {
+        CONFIG.hlsUrl = info.hlsUrl;
+        initPlayer();
+      }
+    });
     initShopFirebase();
   } catch(e) { initDemoChat(); }
 }
