@@ -732,15 +732,12 @@ function toggleStream() {
 }
 
 function startStream() {
-  // ── entry point เดียวคือ Browser Live Panel (📡 ล่างขวา) ──
-  // ปุ่ม "เริ่ม Live" บนสุดทำหน้าที่เปิด panel ให้ Admin เลือกกล้อง/หน้าจอ
-  // HLS URL จะถูก set อัตโนมัติโดย blPollForHlsUrl() เมื่อ GitHub Actions พร้อม
+  // เปิด panel แล้วเรียก blGoLive อัตโนมัติ
   const panel = document.getElementById('browserLivePanel');
-  if (panel) {
-    panel.classList.add('visible');
-    addLog('📡 เปิด Browser Live Panel — กดกล้องหรือหน้าจอเพื่อเริ่ม');
-    showToast('📡 เลือกกล้อง หรือ หน้าจอ แล้วกด "เริ่มไลฟ์"');
-  }
+  if (panel) panel.classList.add('visible');
+  addLog('📡 กดไลฟ์ — เปิดกล้องและเริ่ม server อัตโนมัติ');
+  // เรียก blGoLive ทันที (blGoLive จะขอกล้องเองถ้ายังไม่มี)
+  if (typeof blGoLive === 'function') blGoLive();
 }
 
 function confirmEndStream() {
@@ -1248,30 +1245,34 @@ initShopAdmin();
         <span class="bl-status-dot" id="blDot"></span>
         <span id="blStatusText">พร้อมไลฟ์</span>
       </div>
-      <div style="font-size:11px;color:#666;" id="blUrlDisplay"></div>
+      <div style="font-size:11px;color:#555;margin-top:4px;">
+        เปลี่ยนแหล่งภาพ:
+        <button class="bl-btn bl-btn-cam" onclick="blStartCam()" style="padding:4px 10px;font-size:11px;">📷</button>
+        <button class="bl-btn bl-btn-screen" onclick="blStartScreen()" style="padding:4px 10px;font-size:11px;">🖥</button>
+      </div>
     </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button class="bl-btn bl-btn-cam" onclick="blStartCam()">📷 กล้อง</button>
-      <button class="bl-btn bl-btn-screen" onclick="blStartScreen()">🖥 หน้าจอ</button>
-      <button class="bl-btn bl-btn-go" id="blGoBtn" onclick="blGoLive()" disabled>▶ เริ่มไลฟ์</button>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button class="bl-btn bl-btn-go" id="blGoBtn" onclick="blGoLive()">🔴 เริ่มไลฟ์</button>
       <button class="bl-btn bl-btn-stop" id="blStopBtn" onclick="blStopLive()">■ หยุด</button>
     </div>
   </div>
-  <div class="bl-log" id="blLog">กดปุ่ม "กล้อง" หรือ "หน้าจอ" เพื่อเริ่ม</div>
+  <div class="bl-log" id="blLog">กด "เริ่มไลฟ์" — กล้องจะเปิดอัตโนมัติ</div>
 </div>
 
 <script>
-// ─── Browser Live Module (v2) ──────────────────────────────
-// แก้ไข:
-//  1. blTriggerGitHubActions() — ส่ง X-Admin-Secret header
-//  2. blPollForHlsUrl()        — poll GET /hls-url จาก Worker
-//                                 auto-set Firebase อัตโนมัติ
-//  3. blGoLive()               — flow ต่อเนื่อง ไม่ต้อง paste URL เอง
+// ─── Browser Live Module (v3) ──────────────────────────────
+// ONE-BUTTON LIVE: กดปุ่มเดียว → กล้องเปิดอัตโนมัติ → trigger server
+// → poll WS URL → MediaRecorder → WebSocket → ffmpeg → Nginx → HLS
+// → Firebase → Viewer เห็นภาพ  (ไม่ต้องกรอกอะไรเพิ่มเลย)
 // ──────────────────────────────────────────────────────────
 
-let blStream   = null;
-let blPolling  = null;
-let blHlsUrl   = null;
+let blStream    = null;   // MediaStream (กล้อง/หน้าจอ)
+let blRecorder  = null;   // MediaRecorder
+let blWs        = null;   // WebSocket ไปยัง ffmpeg
+let blPolling   = null;   // interval สำหรับ poll Worker
+let blHlsUrl    = null;
+let blWsUrl     = null;
+let blMode      = 'cam';  // 'cam' | 'screen'
 
 // ── helpers ────────────────────────────────────────────────
 function toggleBrowserPanel() {
@@ -1289,37 +1290,35 @@ function blSetStatus(text, state) {
   dot.className = 'bl-status-dot' + (state ? ' ' + state : '');
 }
 
-// ── กล้อง / หน้าจอ ────────────────────────────────────────
+// ── เปิดกล้อง / หน้าจอ ────────────────────────────────────
 async function blStartCam() {
+  blMode = 'cam';
   try {
+    if (blStream) blStream.getTracks().forEach(t => t.stop());
     blStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     document.getElementById('blPreview').srcObject = blStream;
-    blLog('เปิดกล้องสำเร็จ — กด "เริ่มไลฟ์" ได้เลย');
+    blLog('กล้องพร้อม — กด "เริ่มไลฟ์" ได้เลย');
     blSetStatus('กล้องพร้อม', 'ready');
     document.getElementById('blGoBtn').disabled = false;
   } catch (e) { blLog('ไม่สามารถเข้าถึงกล้องได้: ' + e.message); }
 }
 
 async function blStartScreen() {
+  blMode = 'screen';
   try {
-    const screen = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    if (blStream) {
-      const camAudio = blStream.getAudioTracks()[0];
-      if (camAudio) screen.addTrack(camAudio);
-    }
-    blStream = screen;
-    document.getElementById('blPreview').srcObject = screen;
-    blLog('เปิดหน้าจอสำเร็จ — กด "เริ่มไลฟ์" ได้เลย');
+    if (blStream) blStream.getTracks().forEach(t => t.stop());
+    blStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    document.getElementById('blPreview').srcObject = blStream;
+    blLog('หน้าจอพร้อม — กด "เริ่มไลฟ์" ได้เลย');
     blSetStatus('หน้าจอพร้อม', 'ready');
     document.getElementById('blGoBtn').disabled = false;
   } catch (e) { blLog('ไม่สามารถแชร์หน้าจอได้: ' + e.message); }
 }
 
-// ── Trigger GitHub Actions ผ่าน Worker ────────────────────
-// FIX: เพิ่ม X-Admin-Secret header + trim trailing slash จาก proxyUrl
+// ── Trigger GitHub Actions ─────────────────────────────────
 async function blTriggerGitHubActions() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
-  blLog('🚀 กำลัง trigger GitHub Actions ผ่าน Cloudflare Worker...');
+  blLog('กำลัง trigger GitHub Actions...');
   try {
     const res = await fetch(proxyUrl + '/trigger', {
       method: 'POST',
@@ -1327,43 +1326,41 @@ async function blTriggerGitHubActions() {
         'Content-Type':   'application/json',
         'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '',
       },
-      body: JSON.stringify({ stream_key: ADMIN_CONFIG.streamKeyReal || 'stream_tcc' }),
+      body: JSON.stringify({ stream_key: 'stream_tcc' }),
     });
-
     let data = {};
     try { data = await res.json(); } catch (_) {
-      blLog('❌ Worker ตอบกลับไม่ใช่ JSON — ตรวจสอบ URL: ' + proxyUrl);
+      blLog('Worker ตอบกลับไม่ใช่ JSON — ตรวจ URL: ' + proxyUrl);
       return false;
     }
-
     if (res.ok && data.ok) {
-      blLog('🚀 GitHub Actions รันแล้ว! รอ server เริ่ม (~30 วินาที)...');
+      blLog('GitHub Actions รันแล้ว! กำลังรอ server...');
       return true;
     }
-    blLog('❌ Worker error: ' + (data.error || res.status));
+    blLog('Worker error: ' + (data.error || res.status));
     return false;
   } catch (e) {
-    blLog('❌ ไม่สามารถเชื่อมต่อ Worker: ' + e.message);
+    blLog('ไม่สามารถเชื่อมต่อ Worker: ' + e.message);
     return false;
   }
 }
 
-// ── Poll GET /hls-url จาก Worker → auto-set Firebase ──────
-// FIX: ไม่ต้องดู log GitHub เอง — Worker เก็บ HLS URL ใน KV
-//      GitHub Actions workflow ต้อง POST /hls-url ก่อน (ดูหมายเหตุ)
-async function blPollForHlsUrl() {
+// ── Poll Worker → รอ WS URL + HLS URL ─────────────────────
+function blPollForUrls() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
   let tries = 0;
-  const maxTries = 48; // 48 × 5s = 4 นาที
+  const maxTries = 60; // 60 × 5s = 5 นาที
 
   blPolling = setInterval(async () => {
     tries++;
-    blLog(`⏳ รอ HLS URL จาก server... (${tries * 5}s / ${maxTries * 5}s)`);
+    const elapsed = tries * 5;
+    blLog(`รอ server พร้อม... (${elapsed}s / ${maxTries * 5}s)`);
 
     if (tries > maxTries) {
-      clearInterval(blPolling);
-      blLog('⏰ หมดเวลา — ใส่ HLS URL ในช่อง "ตั้งค่า" แล้วกด "บันทึก" เองได้เลย');
-      blSetStatus('รอ Manual', '');
+      clearInterval(blPolling); blPolling = null;
+      blLog('หมดเวลารอ server — ลองกด Live ใหม่อีกครั้ง');
+      blSetStatus('เกิดข้อผิดพลาด', '');
+      blResetUI();
       return;
     }
 
@@ -1371,79 +1368,174 @@ async function blPollForHlsUrl() {
       const res  = await fetch(proxyUrl + '/hls-url');
       const data = await res.json();
 
-      if (data.ready && data.hls_url) {
-        clearInterval(blPolling);
+      if (data.ready && data.hls_url && data.ws_url) {
+        clearInterval(blPolling); blPolling = null;
         blHlsUrl = data.hls_url;
-
-        // ─── push ไป Firebase ทันที ───
-        if (db) {
-          const title = document.getElementById('streamTitleInput')?.value || '';
-          const desc  = document.getElementById('streamDescInput')?.value  || '';
-          await db.ref('streamInfo').set({ title, desc, hlsUrl: blHlsUrl });
-          await db.ref('liveStats/isLive').set(true);
-          addLog('✅ HLS URL อัปเดต Firebase แล้ว — viewer เห็นภาพแล้ว');
-        }
-
-        blLog('✅ Server พร้อม! สมาชิกเห็นภาพแล้ว');
-        blSetStatus('กำลัง Live 🔴', 'live');
-        document.getElementById('statusDot').className  = 'status-dot live';
-        document.getElementById('statusText').textContent = 'กำลัง Live';
-
-        // อัปเดต state ด้วยเพื่อให้ duration timer เริ่ม
-        if (!isStreaming) {
-          isStreaming = true;
-          streamStartTime = Date.now();
-          if (!streamTimer) streamTimer = setInterval(updateDuration, 1000);
-          document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
-          document.getElementById('goLiveBtn').classList.add('streaming');
-        }
+        blWsUrl  = data.ws_url;
+        blLog('Server พร้อม! กำลังเชื่อมต่อ stream...');
+        blSetStatus('กำลังเชื่อมต่อ...', 'live');
+        // เชื่อม WebSocket แล้วเริ่มส่ง video ทันที
+        blStartStreaming();
       }
-      // ถ้า ready=false ก็รอ interval ต่อไป
-
-    } catch (e) {
-      // network error — รอรอบหน้า ไม่ต้อง log ทุกครั้ง
-    }
+    } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
   }, 5000);
 }
 
-// ── เริ่มไลฟ์ ──────────────────────────────────────────────
-async function blGoLive() {
-  if (!blStream) { blLog('กรุณาเปิดกล้องหรือหน้าจอก่อน'); return; }
-
-  document.getElementById('blGoBtn').style.display  = 'none';
-  document.getElementById('blStopBtn').style.display = 'inline-flex';
-  blSetStatus('กำลังเริ่ม server...', 'live');
-
-  const triggered = await blTriggerGitHubActions();
-  if (!triggered) {
-    document.getElementById('blGoBtn').style.display  = 'inline-flex';
-    document.getElementById('blStopBtn').style.display = 'none';
-    blSetStatus('เกิดข้อผิดพลาด', '');
+// ── MediaRecorder → WebSocket → ffmpeg ────────────────────
+function blStartStreaming() {
+  if (!blStream || !blWsUrl) {
+    blLog('ไม่มี stream หรือ WS URL');
     return;
   }
 
-  // เริ่ม poll — จะ auto-complete เมื่อ GitHub Actions POST /hls-url ลง KV
-  blPollForHlsUrl();
+  // เลือก codec ที่ browser รองรับ
+  const mimeTypes = [
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm',
+  ];
+  const mime = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+
+  blLog('กำลังเชื่อมต่อ WebSocket...');
+
+  blWs = new WebSocket(blWsUrl);
+  blWs.binaryType = 'arraybuffer';
+
+  blWs.onopen = () => {
+    blLog('WebSocket เชื่อมต่อแล้ว — เริ่มส่ง stream!');
+
+    blRecorder = new MediaRecorder(blStream, {
+      mimeType:        mime,
+      videoBitsPerSecond: 1500000, // 1.5 Mbps
+      audioBitsPerSecond: 128000,
+    });
+
+    blRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0 && blWs && blWs.readyState === WebSocket.OPEN) {
+        blWs.send(e.data);
+      }
+    };
+
+    blRecorder.onerror = (e) => {
+      blLog('MediaRecorder error: ' + e.error?.message);
+    };
+
+    // timeslice 500ms — ส่ง chunk ทุก 0.5 วินาที ให้ latency ต่ำ
+    blRecorder.start(500);
+
+    // หลัง stream ไปถึง Nginx ~10 วินาที HLS ควรพร้อม → update Firebase
+    setTimeout(blActivateFirebase, 10000);
+  };
+
+  blWs.onerror = (e) => {
+    blLog('WebSocket error — ตรวจสอบ tunnel ว่า active อยู่ไหม');
+    blSetStatus('เกิดข้อผิดพลาด', '');
+  };
+
+  blWs.onclose = () => {
+    // ถ้าปิด WebSocket ขณะ live อยู่ → แสดง warning
+    if (isStreaming) {
+      blLog('WebSocket ขาดการเชื่อมต่อ — stream หยุด');
+      blSetStatus('ขาดการเชื่อมต่อ', '');
+    }
+  };
+}
+
+// ── อัปเดต Firebase → Viewer เห็นภาพ ─────────────────────
+async function blActivateFirebase() {
+  if (!db || !blHlsUrl) return;
+  try {
+    const title = document.getElementById('streamTitleInput')?.value || '';
+    const desc  = document.getElementById('streamDescInput')?.value  || '';
+    await db.ref('streamInfo').set({ title, desc, hlsUrl: blHlsUrl });
+    await db.ref('liveStats/isLive').set(true);
+
+    blLog('สมาชิกเห็นภาพแล้ว!');
+    blSetStatus('กำลัง Live 🔴', 'live');
+    addLog('✅ Firebase อัปเดตแล้ว — viewer เห็นภาพ');
+
+    // อัปเดต UI หลัก
+    document.getElementById('statusDot').className   = 'status-dot live';
+    document.getElementById('statusText').textContent = 'กำลัง Live';
+    if (!isStreaming) {
+      isStreaming      = true;
+      streamStartTime  = Date.now();
+      if (!streamTimer) streamTimer = setInterval(updateDuration, 1000);
+      document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
+      document.getElementById('goLiveBtn').classList.add('streaming');
+    }
+  } catch (e) {
+    blLog('Firebase update error: ' + e.message);
+  }
+}
+
+// ── ONE-BUTTON LIVE ────────────────────────────────────────
+// กดปุ่ม "เริ่ม Live" เดียว → ทำทุกอย่างอัตโนมัติ
+async function blGoLive() {
+  // ขั้นที่ 1: เปิดกล้องอัตโนมัติถ้ายังไม่มี stream
+  if (!blStream) {
+    blSetStatus('กำลังขอสิทธิ์กล้อง...', '');
+    blLog('กำลังเปิดกล้อง...');
+    try {
+      blStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      document.getElementById('blPreview').srcObject = blStream;
+      blSetStatus('กล้องพร้อม', 'ready');
+    } catch (e) {
+      blLog('ไม่สามารถเปิดกล้องได้: ' + e.message + ' — ลองกด "กล้อง" หรือ "หน้าจอ" ก่อน');
+      blSetStatus('ไม่สามารถเปิดกล้อง', '');
+      return;
+    }
+  }
+
+  // ขั้นที่ 2: อัปเดต UI
+  document.getElementById('blGoBtn').style.display   = 'none';
+  document.getElementById('blStopBtn').style.display  = 'inline-flex';
+  blSetStatus('กำลังเริ่ม server...', 'live');
+
+  // ขั้นที่ 3: trigger GitHub Actions
+  const triggered = await blTriggerGitHubActions();
+  if (!triggered) {
+    blResetUI();
+    return;
+  }
+
+  // ขั้นที่ 4: poll จนได้ WS URL + HLS URL แล้วเชื่อม stream อัตโนมัติ
+  blPollForUrls();
 }
 
 // ── หยุด Live ──────────────────────────────────────────────
 function blStopLive() {
-  if (blStream)  { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
+  // หยุด MediaRecorder
+  if (blRecorder && blRecorder.state !== 'inactive') {
+    blRecorder.stop();
+    blRecorder = null;
+  }
+  // ปิด WebSocket
+  if (blWs) { blWs.close(); blWs = null; }
+  // หยุด stream tracks
+  if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
+  // หยุด poll
   if (blPolling) { clearInterval(blPolling); blPolling = null; }
 
-  document.getElementById('blPreview').srcObject   = null;
-  document.getElementById('blGoBtn').disabled      = true;
-  document.getElementById('blGoBtn').style.display  = 'inline-flex';
-  document.getElementById('blStopBtn').style.display = 'none';
-  blSetStatus('พร้อมไลฟ์', '');
-  blLog('หยุดแล้ว');
+  document.getElementById('blPreview').srcObject = null;
+  blHlsUrl = null;
+  blWsUrl  = null;
+
+  blResetUI();
+  blLog('หยุด Live แล้ว');
 
   // ล้าง Firebase
   if (db) {
     db.ref('liveStats/isLive').set(false);
     db.ref('streamInfo/hlsUrl').remove();
   }
-  blHlsUrl = null;
+}
+
+function blResetUI() {
+  document.getElementById('blGoBtn').disabled      = false;
+  document.getElementById('blGoBtn').style.display  = 'inline-flex';
+  document.getElementById('blStopBtn').style.display = 'none';
+  blSetStatus('พร้อมไลฟ์', '');
 }
 </script>
 
