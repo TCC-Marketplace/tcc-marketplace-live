@@ -604,6 +604,12 @@
 // ─────────────────────────────────────────
 const ADMIN_CONFIG = {
   rtmpServer: 'rtmp://YOUR_SERVER_IP/live',
+  github: {
+    token: '',        // ใส่ GitHub Personal Access Token ที่นี่
+    owner: 'TCC-Marketplace',
+    repo: 'tcc-marketplace-live',
+    workflow: 'stream.yml'
+  },
   streamKeyReal: 'stream_tcc_abc123xyz456',
   firebase: {
     apiKey: "AIzaSyBFqcnFYx81XH3XLQ4QuAe6AP7C334jC38",
@@ -1191,5 +1197,173 @@ initFirebase();
 addLog('⚙️ Admin Panel เริ่มทำงาน');
 initShopAdmin();
 </script>
+
+<!-- ═══════════════════════════════════════════════════════
+     BROWSER LIVE — WebRTC + GitHub Actions Auto-Trigger
+═══════════════════════════════════════════════════════ -->
+<style>
+#browserLivePanel {
+  position:fixed; bottom:0; left:0; right:0; z-index:9999;
+  background:#0a0a0a; border-top:2px solid #ff2d55;
+  padding:12px 16px; display:none;
+  box-shadow:0 -4px 24px rgba(255,45,85,.3);
+}
+#browserLivePanel.visible { display:block; }
+.bl-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.bl-preview { width:160px; height:90px; background:#111; border-radius:8px; object-fit:cover; border:1px solid #333; }
+.bl-status { flex:1; min-width:120px; }
+.bl-status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#555; margin-right:6px; }
+.bl-status-dot.live { background:#ff2d55; animation:blink 1s infinite; }
+.bl-status-dot.ready { background:#30d158; }
+.bl-btn { padding:8px 18px; border-radius:20px; border:none; cursor:pointer; font-weight:700; font-size:13px; }
+.bl-btn-cam { background:#1c1c1e; color:#fff; border:1px solid #333; }
+.bl-btn-screen { background:#1c1c1e; color:#fff; border:1px solid #333; }
+.bl-btn-go { background:#ff2d55; color:#fff; }
+.bl-btn-go:disabled { background:#444; cursor:not-allowed; }
+.bl-btn-stop { background:#ff3b30; color:#fff; display:none; }
+.bl-log { font-size:11px; color:#888; margin-top:6px; height:32px; overflow:hidden; }
+#browserLiveToggle {
+  position:fixed; bottom:16px; right:16px; z-index:10000;
+  background:#ff2d55; color:#fff; border:none; border-radius:50%;
+  width:52px; height:52px; font-size:22px; cursor:pointer;
+  box-shadow:0 4px 16px rgba(255,45,85,.5);
+  display:flex; align-items:center; justify-content:center;
+}
+</style>
+
+<button id="browserLiveToggle" onclick="toggleBrowserPanel()" title="ไลฟ์จาก Browser">📡</button>
+
+<div id="browserLivePanel">
+  <div class="bl-row">
+    <video id="blPreview" class="bl-preview" autoplay muted playsinline></video>
+    <div class="bl-status">
+      <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:4px;">
+        <span class="bl-status-dot" id="blDot"></span>
+        <span id="blStatusText">พร้อมไลฟ์</span>
+      </div>
+      <div style="font-size:11px;color:#666;" id="blUrlDisplay"></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="bl-btn bl-btn-cam" onclick="blStartCam()">📷 กล้อง</button>
+      <button class="bl-btn bl-btn-screen" onclick="blStartScreen()">🖥 หน้าจอ</button>
+      <button class="bl-btn bl-btn-go" id="blGoBtn" onclick="blGoLive()" disabled>▶ เริ่มไลฟ์</button>
+      <button class="bl-btn bl-btn-stop" id="blStopBtn" onclick="blStopLive()">■ หยุด</button>
+    </div>
+  </div>
+  <div class="bl-log" id="blLog">กดปุ่ม "กล้อง" หรือ "หน้าจอ" เพื่อเริ่ม</div>
+</div>
+
+<script>
+// ─── Browser Live Module ───────────────────────────────────
+let blStream = null;
+let blMediaRecorder = null;
+let blChunks = [];
+let blRunId = null;
+let blHlsUrl = null;
+let blRtmpIp = null;
+let blPolling = null;
+
+function toggleBrowserPanel() {
+  const p = document.getElementById('browserLivePanel');
+  p.classList.toggle('visible');
+}
+
+function blLog(msg) {
+  document.getElementById('blLog').textContent = '› ' + msg;
+  addLog('📡 ' + msg);
+}
+
+function blSetStatus(text, state) {
+  document.getElementById('blStatusText').textContent = text;
+  const dot = document.getElementById('blDot');
+  dot.className = 'bl-status-dot' + (state ? ' ' + state : '');
+}
+
+async function blStartCam() {
+  try {
+    blStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+    document.getElementById('blPreview').srcObject = blStream;
+    blLog('เปิดกล้องสำเร็จ — กด "เริ่มไลฟ์" ได้เลย');
+    blSetStatus('กล้องพร้อม', 'ready');
+    document.getElementById('blGoBtn').disabled = false;
+  } catch(e) { blLog('ไม่สามารถเข้าถึงกล้องได้: ' + e.message); }
+}
+
+async function blStartScreen() {
+  try {
+    const screen = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+    if (blStream) { const camAudio = blStream.getAudioTracks()[0]; if(camAudio) screen.addTrack(camAudio); }
+    blStream = screen;
+    document.getElementById('blPreview').srcObject = screen;
+    blLog('เปิดหน้าจอสำเร็จ — กด "เริ่มไลฟ์" ได้เลย');
+    blSetStatus('หน้าจอพร้อม', 'ready');
+    document.getElementById('blGoBtn').disabled = false;
+  } catch(e) { blLog('ไม่สามารถแชร์หน้าจอได้: ' + e.message); }
+}
+
+async function blTriggerGitHubActions() {
+  const { token, owner, repo, workflow } = ADMIN_CONFIG.github;
+  if (!token) { blLog('⚠️ ยังไม่ได้ใส่ GitHub Token ใน ADMIN_CONFIG'); return null; }
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`,
+      { method:'POST', headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json', 'Content-Type':'application/json' },
+        body: JSON.stringify({ ref:'main', inputs:{ stream_key:'stream_tcc' } }) }
+    );
+    if (res.status === 204) { blLog('🚀 GitHub Actions รันแล้ว รอ server เริ่ม (~30 วินาที)...'); return true; }
+    blLog('GitHub API error: ' + res.status); return null;
+  } catch(e) { blLog('GitHub API failed: ' + e.message); return null; }
+}
+
+async function blPollForHlsUrl() {
+  const { token, owner, repo } = ADMIN_CONFIG.github;
+  if (!token) return;
+  let tries = 0;
+  blPolling = setInterval(async () => {
+    tries++;
+    if (tries > 40) { clearInterval(blPolling); blLog('หมดเวลารอ server'); return; }
+    try {
+      const r = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=1`,
+        { headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json' } }
+      );
+      const data = await r.json();
+      const run = data.workflow_runs?.[0];
+      if (!run || run.status === 'queued') { blLog(`รอ server... (${tries*5}s)`); return; }
+      if (run.status === 'in_progress' || run.status === 'completed') {
+        const logsRes = await fetch(run.logs_url, { headers:{ Authorization:`token ${token}` } });
+        // ดึง HLS URL จาก Firebase ที่ admin บันทึกไว้แทน
+        clearInterval(blPolling);
+        blLog('✅ Server พร้อมแล้ว — กรุณาดู HLS URL จาก GitHub Actions log แล้วใส่ในช่อง HLS URL');
+        blSetStatus('Server พร้อม', 'ready');
+      }
+    } catch(e) {}
+  }, 5000);
+}
+
+async function blGoLive() {
+  if (!blStream) { blLog('กรุณาเปิดกล้องหรือหน้าจอก่อน'); return; }
+  document.getElementById('blGoBtn').style.display = 'none';
+  document.getElementById('blStopBtn').style.display = 'inline-flex';
+  blSetStatus('กำลังเริ่ม server...', 'live');
+  const ok = await blTriggerGitHubActions();
+  if (!ok) { document.getElementById('blGoBtn').style.display = 'inline-flex'; document.getElementById('blStopBtn').style.display = 'none'; return; }
+  blLog('⏳ รอ ~30 วินาที จากนั้นดู HLS URL จาก GitHub Actions แล้วใส่ในแท็บ "ตั้งค่า"');
+  await blPollForHlsUrl();
+}
+
+function blStopLive() {
+  if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
+  if (blPolling) clearInterval(blPolling);
+  document.getElementById('blPreview').srcObject = null;
+  document.getElementById('blGoBtn').disabled = true;
+  document.getElementById('blGoBtn').style.display = 'inline-flex';
+  document.getElementById('blStopBtn').style.display = 'none';
+  blSetStatus('พร้อมไลฟ์', '');
+  blLog('หยุดแล้ว');
+  if (db) db.ref('liveStats/isLive').set(false);
+}
+</script>
+
 </body>
 </html>
