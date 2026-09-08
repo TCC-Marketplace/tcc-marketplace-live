@@ -11,62 +11,129 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
-      - name: Install Nginx RTMP
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nginx libnginx-mod-rtmp
-          sudo mkdir -p /tmp/hls
-          sudo chmod 777 /tmp/hls
+          sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd
 
       - name: Write Nginx config
         run: |
           sudo python3 -c "
-          cfg = 'load_module modules/ngx_rtmp_module.so;\nworker_processes auto;\nevents { worker_connections 1024; }\nrtmp {\n  server {\n    listen 1935;\n    chunk_size 4096;\n    application live {\n      live on;\n      record off;\n      hls on;\n      hls_path /tmp/hls;\n      hls_fragment 2s;\n      hls_playlist_length 10s;\n    }\n  }\n}\nhttp {\n  include mime.types;\n  default_type application/octet-stream;\n  server {\n    listen 8080;\n    location / {\n      add_header Access-Control-Allow-Origin \"*\" always;\n      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;\n      add_header Access-Control-Allow-Headers \"*\" always;\n      if (\$request_method = OPTIONS) { return 204; }\n    }\n    location /hls {\n      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }\n      root /tmp;\n      add_header Cache-Control no-cache always;\n      add_header Access-Control-Allow-Origin \"*\" always;\n      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;\n      add_header Access-Control-Allow-Headers \"*\" always;\n    }\n  }\n}'
+          cfg = '''load_module modules/ngx_rtmp_module.so;
+worker_processes auto;
+events { worker_connections 1024; }
+rtmp {
+  server {
+    listen 1935;
+    chunk_size 4096;
+    application live {
+      live on;
+      record off;
+      hls on;
+      hls_path /tmp/hls;
+      hls_fragment 2s;
+      hls_playlist_length 10s;
+    }
+  }
+}
+http {
+  include mime.types;
+  default_type application/octet-stream;
+  server {
+    listen 8080;
+    location / {
+      add_header Access-Control-Allow-Origin \"*\" always;
+      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;
+      add_header Access-Control-Allow-Headers \"*\" always;
+      if (\$request_method = OPTIONS) { return 204; }
+    }
+    location /hls {
+      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }
+      root /tmp;
+      add_header Cache-Control no-cache always;
+      add_header Access-Control-Allow-Origin \"*\" always;
+      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;
+      add_header Access-Control-Allow-Headers \"*\" always;
+    }
+  }
+}'''
           open('/etc/nginx/nginx.conf','w').write(cfg)
           "
+          sudo mkdir -p /tmp/hls
+          sudo chmod 777 /tmp/hls
 
       - name: Start Nginx
         run: sudo nginx
 
+      - name: Install websocat
+        run: |
+          curl -sL https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl \
+            -o websocat
+          chmod +x websocat
+
+      - name: Start WebSocket ingestion (websocat → ffmpeg → RTMP)
+        run: |
+          STREAM_KEY="${{ github.event.inputs.stream_key }}"
+          ./websocat -b --binary ws-l:0.0.0.0:9001 - | \
+            ffmpeg -loglevel warning \
+              -f webm -i pipe:0 \
+              -c:v libx264 -preset ultrafast -tune zerolatency \
+              -c:a aac -ar 44100 \
+              -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
+            > /tmp/ffmpeg.log 2>&1 &
+          echo "WebSocket ingestion started on port 9001"
+
       - name: Install Cloudflare Tunnel
         run: |
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
           chmod +x cloudflared
 
-      - name: Start Tunnel and POST HLS URL to Worker
+      - name: Start tunnels and POST URLs to Worker
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
-          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
-          sleep 15
+          STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          CF_URL=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
-          PUBLIC_IP=$(curl -s https://api.ipify.org)
-          HLS_URL="$CF_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
+          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
+            > /tmp/cf_hls.log 2>&1 &
 
-          echo "========================================"
-          echo " OBS RTMP  : rtmp://$PUBLIC_IP/live"
-          echo " Stream Key: ${{ github.event.inputs.stream_key }}"
-          echo " HLS URL   : $HLS_URL"
-          echo "========================================"
+          ./cloudflared tunnel --url http://localhost:9001 --no-autoupdate \
+            > /tmp/cf_ws.log 2>&1 &
 
-          # ── POST HLS URL ไปที่ Cloudflare Worker ──────────────
+          echo "Waiting for tunnels (20s)..."
+          sleep 20
+
+          HLS_CF=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf_hls.log | head -1)
+          WS_CF=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf_ws.log | head -1)
+
+          HLS_URL="${HLS_CF}/hls/${STREAM_KEY}.m3u8"
+          WS_URL=$(echo "$WS_CF" | sed 's/https:/wss:/')
+
+          echo "HLS URL: $HLS_URL"
+          echo "WS  URL: $WS_URL"
+
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: ${ADMIN_SECRET}" \
-            -d "{\"hls_url\": \"$HLS_URL\"}")
+            -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${WS_URL}\"}")
 
-          echo "Worker response (HTTP $HTTP_STATUS):"
           cat /tmp/worker_res.txt
-
           if [ "$HTTP_STATUS" = "200" ]; then
-            echo "✅ HLS URL ส่งถึง Worker KV แล้ว — Admin poll จะเจอใน ~5 วินาที"
+            echo "OK: URLs posted to Worker KV"
           else
-            echo "❌ POST ล้มเหลว HTTP $HTTP_STATUS — ตรวจ WORKER_URL และ ADMIN_SECRET secrets"
+            echo "FAIL: HTTP $HTTP_STATUS"
             exit 1
           fi
 
       - name: Keep alive
-        run: sleep 21600
+        run: |
+          for i in $(seq 1 720); do
+            sleep 30
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "$((i/2)) min elapsed"
+              tail -2 /tmp/ffmpeg.log 2>/dev/null || true
+            fi
+          done
