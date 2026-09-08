@@ -81,27 +81,24 @@ jobs:
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # ── เปิด websocat รับ WebSocket → pipe ไป ffmpeg ───
-          # แยก process ออกจากกัน: websocat เขียน stdout → ffmpeg อ่าน stdin
-          # ใช้ named pipe (FIFO) เพื่อให้ทั้งคู่ background ได้อิสระ
-          mkfifo /tmp/ws_pipe
-
-          # ffmpeg รออ่าน FIFO (block จนมี data) — background ก่อน
-          ffmpeg -loglevel warning \
-            -f webm -i /tmp/ws_pipe \
-            -c:v libx264 -preset ultrafast -tune zerolatency \
-            -c:a aac -ar 44100 \
-            -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
-            > /tmp/ffmpeg.log 2>&1 &
-          FFMPEG_PID=$!
-
-          # websocat bind port 9001 → เขียนลง FIFO — background
-          ./websocat -b --binary ws-l:0.0.0.0:9001 - > /tmp/ws_pipe &
+          # ── websocat รับ WebSocket binary → pipe ตรงเข้า ffmpeg ─
+          # ใช้ sh-c: addr เพื่อให้ websocat spawn ffmpeg ต่อ stdin
+          # --binary  : ส่ง/รับ WebSocket ในรูป binary frame (ไม่ใช่ text)
+          # -U        : unidirectional — รับอย่างเดียว ไม่ส่งกลับ (ลด overhead)
+          # ws-l:     : alias ของ ws-listen: (confirmed valid)
+          ./websocat --binary -U \
+            ws-l:0.0.0.0:9001 \
+            sh-c:"ffmpeg -loglevel warning \
+              -f webm -i pipe:0 \
+              -c:v libx264 -preset ultrafast -tune zerolatency \
+              -c:a aac -ar 44100 \
+              -f flv rtmp://127.0.0.1/live/${STREAM_KEY}" \
+            >> /tmp/ffmpeg.log 2>&1 &
           WS_PID=$!
 
-          echo "websocat PID=$WS_PID, ffmpeg PID=$FFMPEG_PID"
+          echo "websocat PID=$WS_PID"
 
-          # ── รอ port 9001 พร้อม (max 15s) ─────────────────
+          # ── รอ port 9001 พร้อม (max 15s) ─────────────────────
           echo "Waiting for port 9001 to be ready..."
           for i in $(seq 1 15); do
             if nc -z 127.0.0.1 9001 2>/dev/null; then
@@ -114,6 +111,7 @@ jobs:
           # ตรวจ process ยังอยู่ไหม
           if ! kill -0 $WS_PID 2>/dev/null; then
             echo "ERROR: websocat exited unexpectedly"
+            cat /tmp/ffmpeg.log || true
             exit 1
           fi
           echo "WebSocket ingestion ready on port 9001"
