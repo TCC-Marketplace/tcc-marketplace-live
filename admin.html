@@ -424,11 +424,6 @@
         <option>🎮 อื่นๆ</option>
       </select>
     </div>
-    <div class="form-row">
-      <label class="form-label">HLS URL (ผู้ชม)</label>
-      <input class="form-input" id="hlsUrlInput" placeholder="http://YOUR_SERVER/live/stream.m3u8">
-    </div>
-    <!-- Firebase URL hardcoded in ADMIN_CONFIG — ไม่ต้องกรอกใหม่ -->
     <button class="save-btn" onclick="saveSettings()">💾 บันทึกการตั้งค่า</button>
   </div>
 
@@ -650,17 +645,34 @@ function initFirebase() {
     db.ref('liveChat').limitToLast(100).on('child_added', snap => {
       addModMsg(snap.val(), snap.key);
     });
-    // listen stats
+    // listen stats + isLive state
     db.ref('liveStats').on('value', snap => {
       const d = snap.val() || {};
       updateStats(d);
+      // sync topbar status dot กับ Firebase truth
+      if (d.isLive === true && !isStreaming) {
+        isStreaming = true;
+        streamStartTime = streamStartTime || Date.now();
+        document.getElementById('statusDot').className = 'status-dot live';
+        document.getElementById('statusText').textContent = 'กำลัง Live';
+        document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
+        document.getElementById('goLiveBtn').classList.add('streaming');
+        if (!streamTimer) streamTimer = setInterval(updateDuration, 1000);
+      } else if (d.isLive === false && isStreaming) {
+        isStreaming = false;
+        clearInterval(streamTimer); streamTimer = null;
+        document.getElementById('statusDot').className = 'status-dot offline';
+        document.getElementById('statusText').textContent = 'Offline';
+        document.getElementById('streamDuration').textContent = '';
+        document.getElementById('goLiveBtn').textContent = '🔴 เริ่ม Live';
+        document.getElementById('goLiveBtn').classList.remove('streaming');
+      }
     });
-    // โหลด streamInfo กลับมาแสดงใน input
+    // โหลด streamInfo กลับมาแสดงใน input (title/desc เท่านั้น)
     db.ref('streamInfo').once('value', snap => {
       const info = snap.val() || {};
       if (info.title) document.getElementById('streamTitleInput').value = info.title;
       if (info.desc)  document.getElementById('streamDescInput').value  = info.desc;
-      if (info.hlsUrl) document.getElementById('hlsUrlInput').value = info.hlsUrl;
     });
     addLog('🔥 เชื่อมต่อ Firebase สำเร็จ');
   } catch(e) { initDemo(); }
@@ -720,38 +732,15 @@ function toggleStream() {
 }
 
 function startStream() {
-  const hlsUrl = document.getElementById('hlsUrlInput').value.trim();
-  const title  = document.getElementById('streamTitleInput').value;
-  const desc   = document.getElementById('streamDescInput').value;
-
-  // ─── Guard: ต้องมี HLS URL ก่อนจึงจะ set isLive=true ───
-  // มิฉะนั้น viewer จะเห็น "กำลัง Live" แต่ไม่มีวิดีโอ
-  if (!hlsUrl) {
-    showToast('⚠️ กรุณาใส่ HLS URL ในแท็บ "ตั้งค่า" ก่อนเริ่ม Live');
-    addLog('⚠️ หยุด: ไม่มี HLS URL — กรุณาใส่ก่อนกด Live');
-    return;
+  // ── entry point เดียวคือ Browser Live Panel (📡 ล่างขวา) ──
+  // ปุ่ม "เริ่ม Live" บนสุดทำหน้าที่เปิด panel ให้ Admin เลือกกล้อง/หน้าจอ
+  // HLS URL จะถูก set อัตโนมัติโดย blPollForHlsUrl() เมื่อ GitHub Actions พร้อม
+  const panel = document.getElementById('browserLivePanel');
+  if (panel) {
+    panel.classList.add('visible');
+    addLog('📡 เปิด Browser Live Panel — กดกล้องหรือหน้าจอเพื่อเริ่ม');
+    showToast('📡 เลือกกล้อง หรือ หน้าจอ แล้วกด "เริ่มไลฟ์"');
   }
-
-  isStreaming = true;
-  streamStartTime = Date.now();
-  const dot = document.getElementById('statusDot');
-  dot.className = 'status-dot live';
-  document.getElementById('statusText').textContent = 'กำลัง Live';
-  document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
-  document.getElementById('goLiveBtn').classList.add('streaming');
-  streamTimer = setInterval(updateDuration, 1000);
-
-  if (db) {
-    // set streamInfo (hlsUrl, title, desc) ก่อน แล้วค่อย set isLive=true
-    // เพื่อให้ viewer ดึง HLS URL ได้ทันทีที่เปิดหน้า
-    db.ref('streamInfo').set({ title, desc, hlsUrl }).then(() => {
-      db.ref('liveStats/isLive').set(true);
-    });
-  }
-
-  addLog('🔴 เริ่ม Live Stream แล้ว (HLS: ' + hlsUrl.slice(0, 40) + '...)');
-  showToast('🔴 เริ่ม Live สำเร็จ!');
-  sendSystemMsg('🔴 Live เริ่มแล้ว! ยินดีต้อนรับทุกคน 🎉');
 }
 
 function confirmEndStream() {
@@ -760,7 +749,7 @@ function confirmEndStream() {
 
 function endStream() {
   isStreaming = false;
-  clearInterval(streamTimer);
+  clearInterval(streamTimer); streamTimer = null;
   const dot = document.getElementById('statusDot');
   dot.className = 'status-dot offline';
   document.getElementById('statusText').textContent = 'Offline';
@@ -769,9 +758,10 @@ function endStream() {
   document.getElementById('goLiveBtn').classList.remove('streaming');
   if (db) {
     db.ref('liveStats/isLive').set(false);
-    // clear hlsUrl so viewer shows offline screen
     db.ref('streamInfo/hlsUrl').remove();
   }
+  // ล้าง Browser Panel state ด้วย
+  if (typeof blStopLive === 'function') blStopLive();
   addLog('⏹ หยุด Live Stream แล้ว');
   showToast('⏹ หยุด Live แล้ว');
 }
@@ -953,13 +943,14 @@ function clearPinnedMsg() {
 // SETTINGS
 // ─────────────────────────────────────────
 function saveSettings() {
-  const title = document.getElementById('streamTitleInput').value;
-  const desc = document.getElementById('streamDescInput').value;
-  const hlsUrl = document.getElementById('hlsUrlInput').value.trim();
+  const title  = document.getElementById('streamTitleInput').value;
+  const desc   = document.getElementById('streamDescInput').value;
   if (db) {
-    db.ref('streamInfo').set({ title, desc, hlsUrl });
+    // อัปเดตเฉพาะ title/desc — hlsUrl ถูก set อัตโนมัติโดย blPollForHlsUrl()
+    db.ref('streamInfo/title').set(title);
+    db.ref('streamInfo/desc').set(desc);
   }
-  addLog('💾 บันทึกการตั้งค่าแล้ว' + (hlsUrl ? ' (HLS: ' + hlsUrl.slice(0,40) + '...)' : ''));
+  addLog('💾 บันทึกการตั้งค่าแล้ว');
   showToast('💾 บันทึกสำเร็จ');
 }
 
@@ -1274,7 +1265,7 @@ initShopAdmin();
 // แก้ไข:
 //  1. blTriggerGitHubActions() — ส่ง X-Admin-Secret header
 //  2. blPollForHlsUrl()        — poll GET /hls-url จาก Worker
-//                                 auto-set Firebase + hlsUrlInput
+//                                 auto-set Firebase อัตโนมัติ
 //  3. blGoLive()               — flow ต่อเนื่อง ไม่ต้อง paste URL เอง
 // ──────────────────────────────────────────────────────────
 
@@ -1383,10 +1374,6 @@ async function blPollForHlsUrl() {
       if (data.ready && data.hls_url) {
         clearInterval(blPolling);
         blHlsUrl = data.hls_url;
-
-        // ─── auto-fill ช่อง HLS URL ───
-        const input = document.getElementById('hlsUrlInput');
-        if (input) input.value = blHlsUrl;
 
         // ─── push ไป Firebase ทันที ───
         if (db) {
