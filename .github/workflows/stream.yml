@@ -13,17 +13,35 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ─────────────────────────────────────────────────────────────
+      # STEP 1: Install all dependencies in one apt call
+      # ─────────────────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd
 
+      # ─────────────────────────────────────────────────────────────
+      # STEP 2: Write Nginx config
+      #
+      # สำคัญ: Nginx port 8080 ทำหน้าที่ 3 อย่างในคราวเดียว:
+      #   /hls/   → serve HLS files จาก /tmp/hls
+      #   /ws     → proxy_pass WebSocket ไปยัง websocat (port 9001)
+      #   /       → CORS headers ทั่วไป
+      #
+      # เหตุผล: ใช้ tunnel เดียว (port 8080) แทน 2 tunnels
+      #   - ลด complexity
+      #   - Nginx รองรับ WebSocket upgrade ได้ดีกว่า cloudflared direct
+      #   - cloudflared → Nginx ใช้ HTTP/1.1 (WebSocket-compatible)
+      #   - วิธีนี้แก้ปัญหา "WebSocket failed" ที่เกิดซ้ำใน v3-v9
+      # ─────────────────────────────────────────────────────────────
       - name: Write Nginx config
         run: |
           printf '%s\n' \
             'load_module modules/ngx_rtmp_module.so;' \
             'worker_processes auto;' \
             'events { worker_connections 1024; }' \
+            '' \
             'rtmp {' \
             '  server {' \
             '    listen 1935;' \
@@ -38,226 +56,290 @@ jobs:
             '    }' \
             '  }' \
             '}' \
+            '' \
             'http {' \
             '  include mime.types;' \
             '  default_type application/octet-stream;' \
+            '' \
             '  server {' \
             '    listen 8080;' \
-            '    location / {' \
-            '      add_header Access-Control-Allow-Origin "*" always;' \
+            '' \
+            '    # ── HLS files ───────────────────────────────────────' \
+            '    location /hls {' \
+            '      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }' \
+            '      root /tmp;' \
+            '      add_header Cache-Control "no-cache, no-store" always;' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
             '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
             '      if ($request_method = OPTIONS) { return 204; }' \
             '    }' \
-            '    location /hls {' \
-            '      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }' \
-            '      root /tmp;' \
-            '      add_header Cache-Control no-cache always;' \
-            '      add_header Access-Control-Allow-Origin "*" always;' \
+            '' \
+            '    # ── WebSocket proxy → websocat (port 9001) ──────────' \
+            '    # Nginx จัดการ HTTP Upgrade ก่อนส่งไป upstream' \
+            '    # แก้ปัญหา: cloudflared direct tunnel ไม่รองรับ WS binary ได้ดี' \
+            '    location /ws {' \
+            '      proxy_pass         http://127.0.0.1:9001;' \
+            '      proxy_http_version 1.1;' \
+            '      proxy_set_header   Upgrade    $http_upgrade;' \
+            '      proxy_set_header   Connection "upgrade";' \
+            '      proxy_set_header   Host       $host;' \
+            '      proxy_read_timeout 3600s;' \
+            '      proxy_send_timeout 3600s;' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
+            '      add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Headers "*" always;' \
+            '    }' \
+            '' \
+            '    # ── CORS fallback ────────────────────────────────────' \
+            '    location / {' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
             '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
+            '      if ($request_method = OPTIONS) { return 204; }' \
+            '      return 200 "TCC Stream OK\n";' \
             '    }' \
             '  }' \
             '}' \
           | sudo tee /etc/nginx/nginx.conf > /dev/null
+
           sudo mkdir -p /tmp/hls
           sudo chmod 777 /tmp/hls
-          echo "nginx.conf written — first 3 lines:"
-          head -3 /etc/nginx/nginx.conf
 
+          echo "=== nginx.conf preview (first 5 lines) ==="
+          head -5 /etc/nginx/nginx.conf
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 3: Test and start Nginx
+      # ─────────────────────────────────────────────────────────────
       - name: Test and start Nginx
         run: |
           sudo nginx -t && sudo nginx
           echo "Nginx started OK"
+          # ยืนยัน port 8080 พร้อม
+          sleep 1
+          nc -z 127.0.0.1 8080 && echo "Port 8080: READY" || echo "Port 8080: NOT READY"
 
+      # ─────────────────────────────────────────────────────────────
+      # STEP 4: Install websocat
+      # ─────────────────────────────────────────────────────────────
       - name: Install websocat
         run: |
           curl -sL https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl \
             -o websocat
           chmod +x websocat
+          ./websocat --version
           echo "websocat ready"
 
+      # ─────────────────────────────────────────────────────────────
+      # STEP 5: Start WebSocket ingestion
+      #
+      # Design:
+      #   Browser → wss://xxx.trycloudflare.com/ws
+      #   → Nginx /ws location (HTTP Upgrade)
+      #   → proxy_pass http://127.0.0.1:9001
+      #   → websocat ws-l: รับ WebSocket
+      #   → ffmpeg แปลง WebM → H.264/AAC → RTMP
+      #   → Nginx RTMP → HLS files ใน /tmp/hls
+      #
+      # Key flags:
+      #   --oneshot : รับ 1 connection แล้วออก (ป้องกัน ffmpeg zombie)
+      #               ถ้า Admin reconnect → ต้องมี watchdog restart
+      #   --binary  : binary WebSocket frames (ไม่ใช่ text)
+      #   -U        : unidirectional (รับอย่างเดียว)
+      # ─────────────────────────────────────────────────────────────
       - name: Start WebSocket ingestion
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # ── websocat รับ WebSocket binary → pipe ตรงเข้า ffmpeg ─
-          # --binary    : ส่ง/รับ WebSocket ในรูป binary frame (ไม่ใช่ text)
-          # -U          : unidirectional — รับอย่างเดียว ไม่ส่งกลับ (ลด overhead)
-          # --oneshot   : รับ 1 connection แล้วออก — ป้องกัน ffmpeg spawn ซ้ำ
-          #               ถ้า Admin reconnect WebSocket ให้ restart websocat ใหม่
-          # ws-l:       : alias ของ ws-listen: (confirmed valid)
-          ./websocat --binary -U --oneshot \
-            ws-l:0.0.0.0:9001 \
-            sh-c:"ffmpeg -loglevel warning \
-              -f webm -i pipe:0 \
-              -c:v libx264 -preset ultrafast -tune zerolatency \
-              -x264-params keyint=60:min-keyint=60 \
-              -c:a aac -ar 44100 \
-              -f flv rtmp://127.0.0.1/live/${STREAM_KEY}" \
-            >> /tmp/ffmpeg.log 2>&1 &
-          WS_PID=$!
+          # ── websocat wrapper script (restart loop) ─────────────
+          # ถ้า Admin ปิด/เปิด WebSocket ใหม่ → websocat --oneshot จะออก
+          # wrapper loop จะ restart websocat ใหม่ทันที
+          cat > /tmp/ws_loop.sh << WSEOF
+          #!/bin/bash
+          STREAM_KEY="$STREAM_KEY"
+          echo "[ws_loop] started"
+          while true; do
+            echo "[ws_loop] waiting for connection on port 9001..."
+            ./websocat \
+              --binary \
+              --oneshot \
+              -U \
+              ws-l:127.0.0.1:9001 \
+              sh-c:"ffmpeg -hide_banner -loglevel warning \
+                -f webm -i pipe:0 \
+                -c:v libx264 -preset ultrafast -tune zerolatency \
+                -x264-params keyint=60:min-keyint=60:scenecut=0 \
+                -c:a aac -ar 44100 -b:a 128k \
+                -f flv rtmp://127.0.0.1/live/${STREAM_KEY}" \
+              >> /tmp/ffmpeg.log 2>&1
+            EXIT_CODE=\$?
+            echo "[ws_loop] websocat exited (code=\$EXIT_CODE) — restarting in 1s..."
+            sleep 1
+          done
+          WSEOF
+          chmod +x /tmp/ws_loop.sh
 
-          echo "websocat PID=$WS_PID"
+          # รัน wrapper ใน background
+          bash /tmp/ws_loop.sh &
+          WS_LOOP_PID=$!
+          echo "ws_loop PID=$WS_LOOP_PID"
 
-          # ── รอ port 9001 พร้อม (max 15s) ─────────────────────
-          echo "Waiting for port 9001 to be ready..."
-          for i in $(seq 1 15); do
+          # ── รอ port 9001 พร้อม (max 20s) ─────────────────────
+          echo "Waiting for port 9001..."
+          READY=0
+          for i in $(seq 1 20); do
             if nc -z 127.0.0.1 9001 2>/dev/null; then
-              echo "Port 9001 ready after ${i}s"
+              echo "Port 9001 READY after ${i}s"
+              READY=1
               break
             fi
             sleep 1
           done
 
-          # ตรวจ process ยังอยู่ไหม
-          if ! kill -0 $WS_PID 2>/dev/null; then
-            echo "ERROR: websocat exited unexpectedly"
-            cat /tmp/ffmpeg.log || true
+          if [ "$READY" = "0" ]; then
+            echo "ERROR: port 9001 not ready after 20s"
+            kill $WS_LOOP_PID 2>/dev/null || true
             exit 1
           fi
-          echo "WebSocket ingestion ready on port 9001"
 
+          echo "WebSocket ingestion ready (ws_loop running)"
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 6: Install Cloudflare Tunnel
+      # ─────────────────────────────────────────────────────────────
       - name: Install Cloudflare Tunnel
         run: |
           curl -sL https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/cloudflared-linux-amd64 \
             -o cloudflared
           chmod +x cloudflared
+          ./cloudflared --version
           echo "cloudflared ready"
 
-      - name: Start tunnels and POST URLs to Worker
+      # ─────────────────────────────────────────────────────────────
+      # STEP 7: Start single tunnel and POST URLs to Worker
+      #
+      # ใช้ TUNNEL เดียว (port 8080) แทน 2 tunnels
+      # - HLS URL: https://xxx.trycloudflare.com/hls/STREAM_KEY.m3u8
+      # - WS URL:  wss://xxx.trycloudflare.com/ws
+      #
+      # ทำไม tunnel เดียวถึงดีกว่า:
+      #   - ลด cloudflare API calls (ไม่ rate limit)
+      #   - Nginx จัดการ WebSocket upgrade แทน cloudflared
+      #   - URL เดียวกัน = ไม่มีปัญหา CORS cross-origin
+      # ─────────────────────────────────────────────────────────────
+      - name: Start tunnel and POST URLs to Worker
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # ── ตรวจสอบ secret ──────────────────────────────────
           if [ -z "$WORKER_URL" ]; then
             echo "ERROR: WORKER_URL secret is not set!"
             exit 1
           fi
 
-          # ── เปิด HLS tunnel (port 8080 → Nginx) ─────────────
-          # cloudflared ≥2024 ส่ง URL ไปที่ stderr → redirect 2>&1
-          # แยก log file ก่อน background เพื่อให้ shell buffer flush ถูกต้อง
+          # ── เปิด tunnel เดียว port 8080 ──────────────────────
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
-            > /tmp/cf_hls.log 2>&1 &
-          CF_HLS_PID=$!
+            > /tmp/cf_main.log 2>&1 &
+          CF_PID=$!
+          echo "cloudflared PID=$CF_PID — waiting 45s for tunnel URL..."
+          sleep 45
 
-          # ── เปิด WS tunnel (port 9001 → websocat) ───────────
-          ./cloudflared tunnel --url http://localhost:9001 --no-autoupdate \
-            > /tmp/cf_ws.log 2>&1 &
-          CF_WS_PID=$!
-
-          echo "Tunnels started (PIDs: $CF_HLS_PID $CF_WS_PID) — waiting 40s..."
-          sleep 40
-
-          # ── ดึง URL จาก log ──────────────────────────────────
-          # cloudflared ≥2024 print: "Your quick Tunnel has been created! Visit it at (it's currently disabled):"
-          # แล้วตามด้วย URL บรรทัดถัดไป หรือ inline ใน pattern เดิม
+          # ── extract URL ───────────────────────────────────────
           extract_url() {
-            local logfile="$1"
-            # pattern 1: trycloudflare URL ตรงๆ
-            local url
-            url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$logfile" | head -1)
-            if [ -z "$url" ]; then
-              # pattern 2: cloudflared v2024+ print URL หลัง "| " หรือหลัง "Visit it at"
-              url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$logfile" | head -1)
-            fi
-            echo "$url"
+            grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$1" | head -1
           }
 
-          HLS_CF=$(extract_url /tmp/cf_hls.log)
-          WS_CF=$(extract_url /tmp/cf_ws.log)
+          CF_URL=$(extract_url /tmp/cf_main.log)
 
-          echo "=== cf_hls.log (last 15 lines) ==="
-          tail -15 /tmp/cf_hls.log || true
-          echo "=== cf_ws.log (last 15 lines) ==="
-          tail -15 /tmp/cf_ws.log || true
-          echo "HLS tunnel URL: $HLS_CF"
-          echo "WS  tunnel URL: $WS_CF"
+          echo "=== cf_main.log (last 20 lines) ==="
+          tail -20 /tmp/cf_main.log || true
+          echo "Tunnel URL: $CF_URL"
 
-          # ── retry ถ้ายังไม่ได้ URL ──────────────────────────
-          if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
-            echo "URL ยังไม่มา — รอเพิ่ม 30s แล้ว retry..."
+          # ── retry 1 ครั้ง ถ้ายังไม่ได้ URL ──────────────────
+          if [ -z "$CF_URL" ]; then
+            echo "URL ยังไม่มา — รอเพิ่ม 30s..."
             sleep 30
-            HLS_CF=$(extract_url /tmp/cf_hls.log)
-            WS_CF=$(extract_url /tmp/cf_ws.log)
-            echo "Retry — HLS: $HLS_CF | WS: $WS_CF"
+            CF_URL=$(extract_url /tmp/cf_main.log)
+            echo "Retry URL: $CF_URL"
           fi
 
-          if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
-            echo "FATAL: ไม่พบ tunnel URL หลังรอ 70s"
-            echo "=== Full cf_hls.log ==="
-            cat /tmp/cf_hls.log || true
-            echo "=== Full cf_ws.log ==="
-            cat /tmp/cf_ws.log || true
+          if [ -z "$CF_URL" ]; then
+            echo "FATAL: ไม่พบ tunnel URL หลังรอ 75s"
+            echo "=== Full cf_main.log ==="
+            cat /tmp/cf_main.log || true
+            kill $CF_PID 2>/dev/null || true
             exit 1
           fi
 
-          HLS_URL="${HLS_CF}/hls/${STREAM_KEY}.m3u8"
-          WS_URL=$(echo "$WS_CF" | sed 's/https:/wss:/')
+          # ── สร้าง URL จาก tunnel เดียว ───────────────────────
+          HLS_URL="${CF_URL}/hls/${STREAM_KEY}.m3u8"
+          # WS URL ใช้ path /ws ผ่าน Nginx proxy_pass → port 9001
+          WS_URL=$(echo "$CF_URL" | sed 's/https:/wss:/')/ws
 
           echo "HLS_URL = $HLS_URL"
           echo "WS_URL  = $WS_URL"
 
-          # ── ตรวจ local service ยังทำงานอยู่ไหม ─────────────
+          # ── ตรวจ service health ───────────────────────────────
           echo "=== Service health check ==="
-          nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx/HLS): OK" || echo "Port 8080: NOT READY ⚠️"
-          nc -z 127.0.0.1 9001 && echo "Port 9001 (websocat):  OK" || echo "Port 9001: NOT READY ⚠️"
-          nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):      OK" || echo "Port 1935: NOT READY ⚠️"
+          nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx):    OK" || echo "Port 8080: DOWN ⚠️"
+          nc -z 127.0.0.1 9001 && echo "Port 9001 (websocat): OK" || echo "Port 9001: DOWN ⚠️"
+          nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):     OK" || echo "Port 1935: DOWN ⚠️"
 
-          # ── รอ HLS .m3u8 พร้อมจริงก่อน POST URL ─────────────
-          # Nginx เขียน .m3u8 หลังจาก ffmpeg ส่ง segment แรกมาถึง (~3-8 วินาที)
-          # ถ้า POST URL ก่อน → Viewer fetch 404 → HLS.js fatal error → offline screen
-          echo "Waiting for HLS .m3u8 to be ready on Nginx..."
-          HLS_READY=0
-          for i in $(seq 1 30); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://127.0.0.1:8080/hls/${STREAM_KEY}.m3u8" 2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ HLS .m3u8 ready after ${i}s (HTTP 200)"
-              HLS_READY=1
-              break
-            fi
-            echo "  [${i}s] m3u8 HTTP ${HTTP_CODE} — waiting..."
-            sleep 2
-          done
-
-          if [ "$HLS_READY" = "0" ]; then
-            echo "⚠️  HLS .m3u8 ไม่พร้อมใน 60s — POST URL ไปก่อน (Viewer จะ retry)"
-          fi
-
-          # ── POST URLs ไปยัง Cloudflare Worker KV ────────────
+          # ── POST URLs → Worker KV ─────────────────────────────
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: ${ADMIN_SECRET}" \
             -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${WS_URL}\"}")
 
-          echo "Worker HTTP status: $HTTP_STATUS"
+          echo "Worker HTTP: $HTTP_STATUS"
           cat /tmp/worker_res.txt
           echo ""
 
           if [ "$HTTP_STATUS" = "200" ]; then
-            echo "SUCCESS: HLS + WS URLs saved to Worker KV"
-            echo "Viewers can now load the stream!"
+            echo "SUCCESS: URLs saved to Worker KV"
           else
-            echo "FAIL: Worker returned HTTP $HTTP_STATUS"
+            echo "FAIL: Worker returned $HTTP_STATUS"
             exit 1
           fi
 
+      # ─────────────────────────────────────────────────────────────
+      # STEP 8: Keep alive with watchdog
+      #
+      # watchdog ทุก 10 นาที:
+      #   - ตรวจ port 9001 (websocat) และ 8080 (nginx)
+      #   - ถ้า port 9001 down → restart ws_loop
+      #   - print ffmpeg log tail
+      # ─────────────────────────────────────────────────────────────
       - name: Keep alive (max 6 hours)
         run: |
-          echo "Stream is LIVE — keeping runner alive..."
+          echo "Stream is LIVE — keeping runner alive (max 6h)..."
+          STREAM_KEY="${{ github.event.inputs.stream_key }}"
+
           for i in $(seq 1 720); do
             sleep 30
+
             if [ $((i % 20)) -eq 0 ]; then
-              echo "=== $((i/2)) min elapsed ==="
-              tail -3 /tmp/ffmpeg.log 2>/dev/null || true
-              # ── watchdog: ตรวจ service ยังทำงานอยู่ ──────
-              nc -z 127.0.0.1 9001 || echo "⚠️ port 9001 down"
-              nc -z 127.0.0.1 8080 || echo "⚠️ port 8080 down"
+              ELAPSED_MIN=$((i/2))
+              echo "=== ${ELAPSED_MIN} min elapsed ==="
+              tail -5 /tmp/ffmpeg.log 2>/dev/null || true
+
+              # ── watchdog: ตรวจและ restart ถ้าจำเป็น ─────────
+              if ! nc -z 127.0.0.1 9001 2>/dev/null; then
+                echo "⚠️ port 9001 down — restarting ws_loop..."
+                bash /tmp/ws_loop.sh &
+                sleep 3
+                nc -z 127.0.0.1 9001 && echo "✅ port 9001 recovered" || echo "❌ port 9001 still down"
+              fi
+
+              if ! nc -z 127.0.0.1 8080 2>/dev/null; then
+                echo "⚠️ port 8080 down — restarting nginx..."
+                sudo nginx
+                sleep 2
+                nc -z 127.0.0.1 8080 && echo "✅ port 8080 recovered" || echo "❌ port 8080 still down"
+              fi
             fi
           done
