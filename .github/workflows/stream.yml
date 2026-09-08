@@ -17,23 +17,33 @@ jobs:
           sudo apt-get install -y nginx libnginx-mod-rtmp
           sudo mkdir -p /tmp/hls
           sudo chmod 777 /tmp/hls
+
       - name: Write Nginx config
         run: |
           sudo python3 -c "
           cfg = 'load_module modules/ngx_rtmp_module.so;\nworker_processes auto;\nevents { worker_connections 1024; }\nrtmp {\n  server {\n    listen 1935;\n    chunk_size 4096;\n    application live {\n      live on;\n      record off;\n      hls on;\n      hls_path /tmp/hls;\n      hls_fragment 2s;\n      hls_playlist_length 10s;\n    }\n  }\n}\nhttp {\n  include mime.types;\n  default_type application/octet-stream;\n  server {\n    listen 8080;\n    location /hls {\n      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }\n      root /tmp;\n      add_header Cache-Control no-cache;\n      add_header Access-Control-Allow-Origin *;\n    }\n  }\n}'
           open('/etc/nginx/nginx.conf','w').write(cfg)
           "
-      - name: Test and start Nginx
+
+      - name: Start Nginx
+        run: sudo nginx
+
+      - name: Install Cloudflare Tunnel
         run: |
-          sudo nginx -t
-          sudo nginx
-      - name: Print HLS URL
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Start Cloudflare Tunnel and get HTTPS URL
         run: |
-          IP=$(curl -s https://api.ipify.org)
+          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
+          sleep 8
+          HTTPS_URL=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
           echo "========================================"
-          echo " RTMP : rtmp://$IP/live"
-          echo " KEY  : ${{ github.event.inputs.stream_key }}"
-          echo " HLS  : http://$IP:8080/hls/${{ github.event.inputs.stream_key }}.m3u8"
+          echo " RTMP     : rtmp://$(curl -s https://api.ipify.org)/live"
+          echo " KEY      : ${{ github.event.inputs.stream_key }}"
+          echo " HLS URL  : $HTTPS_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
           echo "========================================"
+          echo "copy HLS URL (https) ไปใส่ใน TCC Admin"
+
       - name: Keep alive
         run: sleep 21600
