@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>⚙️ Admin – TCC Live Control</title>
+<link rel="icon" href="data:,">
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <style>
@@ -1316,31 +1317,57 @@ async function blStartScreen() {
 }
 
 // ── Trigger GitHub Actions ─────────────────────────────────
+// แก้ไข: เพิ่ม validation, error detail, และ retry 1 ครั้ง
 async function blTriggerGitHubActions() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
+
+  // ตรวจว่า Worker URL ถูกตั้งค่าแล้ว
+  if (!proxyUrl || proxyUrl.includes('YOUR_WORKER')) {
+    blLog('❌ ยังไม่ได้ตั้งค่า proxyUrl ใน ADMIN_CONFIG');
+    return false;
+  }
+
   blLog('กำลัง trigger GitHub Actions...');
-  try {
+
+  const doTrigger = async () => {
     const res = await fetch(proxyUrl + '/trigger', {
       method: 'POST',
       headers: {
         'Content-Type':   'application/json',
         'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '',
       },
-      body: JSON.stringify({ stream_key: 'stream_tcc' }),
+      body: JSON.stringify({ stream_key: ADMIN_CONFIG.streamKeyReal || 'stream_tcc' }),
     });
+
     let data = {};
-    try { data = await res.json(); } catch (_) {
-      blLog('Worker ตอบกลับไม่ใช่ JSON — ตรวจ URL: ' + proxyUrl);
-      return false;
+    try { data = await res.json(); } catch (_) {}
+
+    return { res, data };
+  };
+
+  try {
+    let { res, data } = await doTrigger();
+
+    // ถ้า 502 (GitHub 422) → รอ 3 วินาที แล้ว retry 1 ครั้ง
+    if (res.status === 502 && !data.ok) {
+      blLog('Worker ตอบ 502 — retry ใน 3 วินาที...');
+      await new Promise(r => setTimeout(r, 3000));
+      ({ res, data } = await doTrigger());
     }
+
     if (res.ok && data.ok) {
-      blLog('GitHub Actions รันแล้ว! กำลังรอ server...');
+      blLog('✅ GitHub Actions รันแล้ว! กำลังรอ server...');
       return true;
     }
-    blLog('Worker error: ' + (data.error || res.status));
+
+    // แสดง error detail เพื่อ debug ง่ายขึ้น
+    const detail = data.detail ? ` (${data.detail.substring(0, 80)})` : '';
+    blLog(`❌ Worker error: ${data.error || res.status}${detail}`);
+    addLog(`Worker error detail: HTTP ${res.status} — ${JSON.stringify(data)}`);
     return false;
+
   } catch (e) {
-    blLog('ไม่สามารถเชื่อมต่อ Worker: ' + e.message);
+    blLog('❌ ไม่สามารถเชื่อมต่อ Worker: ' + e.message);
     return false;
   }
 }
@@ -1349,12 +1376,13 @@ async function blTriggerGitHubActions() {
 function blPollForUrls() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
   let tries = 0;
-  const maxTries = 60; // 60 × 5s = 5 นาที
+  const maxTries = 96; // 96 × 5s = 8 นาที (GitHub Actions ใช้เวลา ~3-5 นาทีในการ start)
 
   blPolling = setInterval(async () => {
     tries++;
     const elapsed = tries * 5;
-    blLog(`รอ server พร้อม... (${elapsed}s / ${maxTries * 5}s)`);
+    const remain = Math.ceil((maxTries - tries) * 5 / 60);
+    blLog(`รอ server พร้อม... (${elapsed}s ผ่านไป | เหลือ ~${remain} นาที)`);
 
     if (tries > maxTries) {
       clearInterval(blPolling); blPolling = null;
