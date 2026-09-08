@@ -21,7 +21,7 @@ jobs:
       - name: Write Nginx config
         run: |
           sudo python3 -c "
-          cfg = 'load_module modules/ngx_rtmp_module.so;\nworker_processes auto;\nevents { worker_connections 1024; }\nrtmp {\n  server {\n    listen 1935;\n    chunk_size 4096;\n    application live {\n      live on;\n      record off;\n      hls on;\n      hls_path /tmp/hls;\n      hls_fragment 2s;\n      hls_playlist_length 10s;\n    }\n  }\n}\nhttp {\n  include mime.types;\n  default_type application/octet-stream;\n  server {\n    listen 8080;\n    location /hls {\n      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }\n      root /tmp;\n      add_header Cache-Control no-cache;\n      add_header Access-Control-Allow-Origin *;\n    }\n  }\n}'
+          cfg = 'load_module modules/ngx_rtmp_module.so;\nworker_processes auto;\nevents { worker_connections 1024; }\nrtmp {\n  server {\n    listen 1935;\n    chunk_size 4096;\n    application live {\n      live on;\n      record off;\n      hls on;\n      hls_path /tmp/hls;\n      hls_fragment 2s;\n      hls_playlist_length 10s;\n    }\n  }\n}\nhttp {\n  include mime.types;\n  default_type application/octet-stream;\n  server {\n    listen 8080;\n    location / {\n      add_header Access-Control-Allow-Origin \"*\" always;\n      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;\n      add_header Access-Control-Allow-Headers \"*\" always;\n      if (\$request_method = OPTIONS) { return 204; }\n    }\n    location /hls {\n      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }\n      root /tmp;\n      add_header Cache-Control no-cache always;\n      add_header Access-Control-Allow-Origin \"*\" always;\n      add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;\n      add_header Access-Control-Allow-Headers \"*\" always;\n    }\n  }\n}'
           open('/etc/nginx/nginx.conf','w').write(cfg)
           "
 
@@ -30,20 +30,23 @@ jobs:
 
       - name: Install Cloudflare Tunnel
         run: |
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
 
-      - name: Start Cloudflare Tunnel and get HTTPS URL
+      - name: Start Tunnel and print URLs
         run: |
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
-          sleep 8
-          HTTPS_URL=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          sleep 10
+          CF_URL=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          PUBLIC_IP=$(curl -s https://api.ipify.org)
           echo "========================================"
-          echo " RTMP     : rtmp://$(curl -s https://api.ipify.org)/live"
-          echo " KEY      : ${{ github.event.inputs.stream_key }}"
-          echo " HLS URL  : $HTTPS_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
+          echo " OBS RTMP  : rtmp://$PUBLIC_IP/live"
+          echo " Stream Key: ${{ github.event.inputs.stream_key }}"
+          echo " HLS URL   : $CF_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
           echo "========================================"
-          echo "copy HLS URL (https) ไปใส่ใน TCC Admin"
+          echo "1. ใส่ RTMP URL ใน OBS แล้ว Start Streaming"
+          echo "2. ใส่ HLS URL ใน TCC Admin แล้วกด บันทึก"
+          echo "3. กด เริ่ม Live"
 
       - name: Keep alive
         run: sleep 21600
