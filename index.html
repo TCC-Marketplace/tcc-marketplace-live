@@ -836,29 +836,42 @@ function initFirebase() {
     if (CONFIG.firebase.apiKey === 'YOUR_API_KEY') { initDemoChat(); return; }
     firebase.initializeApp(CONFIG.firebase);
     db = firebase.database();
-    const chatRef = db.ref('liveChat');
-    chatRef.limitToLast(80).on('child_added', snap => {
-      const msg = snap.val();
-      appendChatMsg(msg);
+
+    // ── Chat ──────────────────────────────────────────────
+    db.ref('liveChat').limitToLast(80).on('child_added', snap => {
+      appendChatMsg(snap.val());
     });
-    const statsRef = db.ref('liveStats');
-    statsRef.on('value', snap => {
+
+    // ── liveStats: likes, shares, viewers, isLive ─────────
+    db.ref('liveStats').on('value', snap => {
       const d = snap.val() || {};
-      if (d.likes) { likeCount = d.likes; updateLikeUI(); }
-      if (d.shares) { shareCount = d.shares; updateShareUI(); }
-      if (d.viewers) document.getElementById('viewerCount').textContent = d.viewers.toLocaleString();
-      // แสดง/ซ่อน offline screen ตาม isLive
-      const offline = document.getElementById('offlineScreen');
+      if (d.likes   !== undefined) { likeCount = d.likes;   updateLikeUI(); }
+      if (d.shares  !== undefined) { shareCount = d.shares;  updateShareUI(); }
+      if (d.viewers !== undefined) {
+        document.getElementById('viewerCount').textContent = d.viewers.toLocaleString();
+      }
+      // isLive ถูก set เป็น false → ล้าง player แสดง offline screen
       if (d.isLive === false) {
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
         streamLive = false;
+        const offline = document.getElementById('offlineScreen');
         if (offline) offline.style.display = 'flex';
       }
+      // isLive ถูก set เป็น true → ถ้ามี hlsUrl ใน CONFIG ให้ init player
+      // (กรณีที่ viewer โหลดหน้าหลัง Admin กด Live แล้ว แต่ streamInfo มาถึงก่อน)
+      if (d.isLive === true && CONFIG.hlsUrl && !streamLive) {
+        const offline = document.getElementById('offlineScreen');
+        if (offline) offline.style.display = 'none';
+        initPlayer();
+      }
     });
-    // ─── อ่าน streamInfo จาก Admin → อัปเดต HLS URL + title อัตโนมัติ ───
+
+    // ── streamInfo: hlsUrl + title + desc ────────────────
+    // Admin set streamInfo ก่อน isLive=true เสมอ (ดู startStream fix)
+    // Viewer จะได้รับ hlsUrl ทันทีที่ isLive event มาถึง
     db.ref('streamInfo').on('value', snap => {
       const info = snap.val() || {};
-      // อัปเดต title / desc บนหน้า
+
       if (info.title) {
         const el = document.getElementById('streamTitle');
         if (el) el.textContent = info.title;
@@ -867,14 +880,28 @@ function initFirebase() {
         const el = document.getElementById('streamSub');
         if (el) el.textContent = info.desc;
       }
-      // อัปเดต hlsUrl และเริ่ม player (ทุกครั้งที่ข้อมูลเปลี่ยน)
+
       if (info.hlsUrl) {
+        // URL เปลี่ยน หรือเพิ่งได้รับครั้งแรก → (re-)init player
+        const changed = CONFIG.hlsUrl !== info.hlsUrl;
         CONFIG.hlsUrl = info.hlsUrl;
-        initPlayer();
+        if (changed || !streamLive) {
+          initPlayer();
+        }
+      } else if (info.hlsUrl === null || info.hlsUrl === undefined) {
+        // Admin remove hlsUrl (endStream) → แสดง offline screen
+        CONFIG.hlsUrl = '';
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        streamLive = false;
+        const offline = document.getElementById('offlineScreen');
+        if (offline) offline.style.display = 'flex';
       }
     });
+
+    // ── Shop sync — db พร้อมแล้วแน่นอน ณ จุดนี้ ─────────
     initShopFirebase();
-  } catch(e) { initDemoChat(); }
+
+  } catch (e) { initDemoChat(); }
 }
 
 function sendChatToFirebase(text) {
