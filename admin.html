@@ -605,7 +605,8 @@
 const ADMIN_CONFIG = {
   rtmpServer: 'rtmp://YOUR_SERVER_IP/live',
   github: {
-    token: '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',        // ใส่ GitHub Personal Access Token ที่นี่
+    // Token ถูกย้ายไปเก็บใน Cloudflare Worker แล้ว (ปลอดภัย)
+    proxyUrl: 'https://tcc-marketplace-live.tcc-team-developer.workers.dev/',
     owner: 'TCC-Marketplace',
     repo: 'tcc-marketplace-live',
     workflow: 'stream.yml'
@@ -1302,21 +1303,26 @@ async function blStartScreen() {
 }
 
 async function blTriggerGitHubActions() {
-  const { token, owner, repo, workflow } = ADMIN_CONFIG.github;
-  if (!token) { blLog('⚠️ ยังไม่ได้ใส่ GitHub Token ใน ADMIN_CONFIG'); return null; }
+  const { proxyUrl } = ADMIN_CONFIG.github;
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`,
-      { method:'POST', headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json', 'Content-Type':'application/json' },
-        body: JSON.stringify({ ref:'main', inputs:{ stream_key:'stream_tcc' } }) }
-    );
-    if (res.status === 204) { blLog('🚀 GitHub Actions รันแล้ว รอ server เริ่ม (~30 วินาที)...'); return true; }
-    blLog('GitHub API error: ' + res.status); return null;
-  } catch(e) { blLog('GitHub API failed: ' + e.message); return null; }
+    blLog('🚀 กำลัง trigger GitHub Actions ผ่าน Cloudflare Worker...');
+    const res = await fetch(proxyUrl + '/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream_key: 'stream_tcc' })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      blLog('🚀 GitHub Actions รันแล้ว! รอ server เริ่ม (~30 วินาที)...');
+      return true;
+    }
+    blLog('Proxy error: ' + (data.error || res.status));
+    return null;
+  } catch(e) { blLog('ไม่สามารถเชื่อมต่อ proxy: ' + e.message); return null; }
 }
 
 async function blPollForHlsUrl() {
-  const { token, owner, repo } = ADMIN_CONFIG.github;
+  const { owner, repo } = ADMIN_CONFIG.github;
   if (!token) return;
   let tries = 0;
   blPolling = setInterval(async () => {
@@ -1325,7 +1331,7 @@ async function blPollForHlsUrl() {
     try {
       const r = await fetch(
         `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=1`,
-        { headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json' } }
+        { headers:{ Accept:'application/vnd.github.v3+json' } }
       );
       const data = await r.json();
       const run = data.workflow_runs?.[0];
