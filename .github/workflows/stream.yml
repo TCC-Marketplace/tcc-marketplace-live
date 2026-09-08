@@ -13,73 +13,70 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ── 1. ติดตั้ง dependencies ───────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd
 
-      # ── 2. เขียน nginx.conf ด้วย heredoc (แก้ YAML syntax error บรรทัด 23) ──
       - name: Write Nginx config
         run: |
-          sudo tee /etc/nginx/nginx.conf > /dev/null << 'NGINX_EOF'
-          load_module modules/ngx_rtmp_module.so;
-          worker_processes auto;
-          events { worker_connections 1024; }
-          rtmp {
-            server {
-              listen 1935;
-              chunk_size 4096;
-              application live {
-                live on;
-                record off;
-                hls on;
-                hls_path /tmp/hls;
-                hls_fragment 2s;
-                hls_playlist_length 10s;
-              }
-            }
-          }
-          http {
-            include mime.types;
-            default_type application/octet-stream;
-            server {
-              listen 8080;
-              location / {
-                add_header Access-Control-Allow-Origin "*" always;
-                add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
-                add_header Access-Control-Allow-Headers "*" always;
-                if ($request_method = OPTIONS) { return 204; }
-              }
-              location /hls {
-                types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }
-                root /tmp;
-                add_header Cache-Control no-cache always;
-                add_header Access-Control-Allow-Origin "*" always;
-                add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
-                add_header Access-Control-Allow-Headers "*" always;
-              }
-            }
-          }
-          NGINX_EOF
-
+          printf '%s\n' \
+            'load_module modules/ngx_rtmp_module.so;' \
+            'worker_processes auto;' \
+            'events { worker_connections 1024; }' \
+            'rtmp {' \
+            '  server {' \
+            '    listen 1935;' \
+            '    chunk_size 4096;' \
+            '    application live {' \
+            '      live on;' \
+            '      record off;' \
+            '      hls on;' \
+            '      hls_path /tmp/hls;' \
+            '      hls_fragment 2s;' \
+            '      hls_playlist_length 10s;' \
+            '    }' \
+            '  }' \
+            '}' \
+            'http {' \
+            '  include mime.types;' \
+            '  default_type application/octet-stream;' \
+            '  server {' \
+            '    listen 8080;' \
+            '    location / {' \
+            '      add_header Access-Control-Allow-Origin "*" always;' \
+            '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Headers "*" always;' \
+            '      if ($request_method = OPTIONS) { return 204; }' \
+            '    }' \
+            '    location /hls {' \
+            '      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }' \
+            '      root /tmp;' \
+            '      add_header Cache-Control no-cache always;' \
+            '      add_header Access-Control-Allow-Origin "*" always;' \
+            '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Headers "*" always;' \
+            '    }' \
+            '  }' \
+            '}' \
+          | sudo tee /etc/nginx/nginx.conf > /dev/null
           sudo mkdir -p /tmp/hls
           sudo chmod 777 /tmp/hls
+          echo "nginx.conf written — first 3 lines:"
+          head -3 /etc/nginx/nginx.conf
 
-      # ── 3. ทดสอบ config แล้วเริ่ม Nginx ─────────────────────
-      - name: Start Nginx
+      - name: Test and start Nginx
         run: |
-          sudo nginx -t
-          sudo nginx
+          sudo nginx -t && sudo nginx
+          echo "Nginx started OK"
 
-      # ── 4. ติดตั้ง websocat ───────────────────────────────────
       - name: Install websocat
         run: |
           curl -sL https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl \
             -o websocat
           chmod +x websocat
+          echo "websocat ready"
 
-      # ── 5. เริ่ม WebSocket → ffmpeg → RTMP ───────────────────
       - name: Start WebSocket ingestion
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
@@ -92,14 +89,13 @@ jobs:
             > /tmp/ffmpeg.log 2>&1 &
           echo "WebSocket ingestion started on port 9001"
 
-      # ── 6. ติดตั้ง cloudflared (version คงที่ เพื่อ stability) ──
       - name: Install Cloudflare Tunnel
         run: |
           curl -sL https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/cloudflared-linux-amd64 \
             -o cloudflared
           chmod +x cloudflared
+          echo "cloudflared ready"
 
-      # ── 7. เปิด tunnel + POST URLs → Worker KV ───────────────
       - name: Start tunnels and POST URLs to Worker
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
@@ -107,72 +103,84 @@ jobs:
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # เปิด HLS tunnel (port 8080)
+          # ตรวจสอบ WORKER_URL secret ก่อน
+          if [ -z "$WORKER_URL" ]; then
+            echo "ERROR: WORKER_URL secret is not set in GitHub Secrets!"
+            echo "ไปที่: repo Settings → Secrets → Actions → New repository secret"
+            echo "Name: WORKER_URL"
+            echo "Value: https://tcc-marketplace-live.tcc-team-developer.workers.dev"
+            exit 1
+          fi
+
+          # เปิด HLS tunnel (port 8080 → Nginx)
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
-            > /tmp/cf_hls.log 2>&1 &
+            2>&1 | tee /tmp/cf_hls.log &
+          CF_HLS_PID=$!
 
-          # เปิด WS tunnel (port 9001)
+          # เปิด WS tunnel (port 9001 → websocat)
           ./cloudflared tunnel --url http://localhost:9001 --no-autoupdate \
-            > /tmp/cf_ws.log 2>&1 &
+            2>&1 | tee /tmp/cf_ws.log &
+          CF_WS_PID=$!
 
-          echo "Waiting for tunnels (30s)..."
-          sleep 30
+          echo "Waiting 35s for tunnels to initialize..."
+          sleep 35
 
-          # ดึง URL จาก log — รองรับทั้ง format เก่าและใหม่ของ cloudflared
+          # ดึง URL — cloudflared ≥2024 log ไปที่ stdout
           HLS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_hls.log | head -1)
           WS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ws.log | head -1)
 
-          # Fallback: บางเวอร์ชัน cloudflared log ไปที่ stderr
-          if [ -z "$HLS_CF" ]; then
-            HLS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_hls.log 2>/dev/null | head -1)
-          fi
-
-          echo "HLS tunnel: $HLS_CF"
-          echo "WS  tunnel: $WS_CF"
+          echo "=== cf_hls.log (last 10 lines) ==="
+          tail -10 /tmp/cf_hls.log || true
+          echo "=== cf_ws.log (last 10 lines) ==="
+          tail -10 /tmp/cf_ws.log || true
+          echo "HLS tunnel URL: $HLS_CF"
+          echo "WS  tunnel URL: $WS_CF"
 
           if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
-            echo "ERROR: tunnel URL not found — ดู log:"
-            cat /tmp/cf_hls.log || true
-            cat /tmp/cf_ws.log  || true
+            echo "ERROR: ไม่พบ tunnel URL — cloudflared อาจยังไม่พร้อม รอเพิ่มอีก 30s..."
+            sleep 30
+            HLS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_hls.log | head -1)
+            WS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ws.log | head -1)
+            echo "Retry — HLS: $HLS_CF | WS: $WS_CF"
+          fi
+
+          if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
+            echo "FATAL: tunnel URL ยังไม่มา — ยกเลิก"
             exit 1
           fi
 
           HLS_URL="${HLS_CF}/hls/${STREAM_KEY}.m3u8"
           WS_URL=$(echo "$WS_CF" | sed 's/https:/wss:/')
 
-          echo "HLS URL: $HLS_URL"
-          echo "WS  URL: $WS_URL"
+          echo "HLS_URL = $HLS_URL"
+          echo "WS_URL  = $WS_URL"
 
-          # ตรวจสอบว่า WORKER_URL ถูกตั้งค่าแล้ว
-          if [ -z "$WORKER_URL" ]; then
-            echo "ERROR: WORKER_URL secret is not set!"
-            exit 1
-          fi
-
+          # POST URLs ไปยัง Cloudflare Worker KV
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: ${ADMIN_SECRET}" \
             -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${WS_URL}\"}")
 
-          echo "Worker response (HTTP $HTTP_STATUS):"
+          echo "Worker HTTP status: $HTTP_STATUS"
           cat /tmp/worker_res.txt
+          echo ""
 
           if [ "$HTTP_STATUS" = "200" ]; then
-            echo "OK: URLs posted to Worker KV"
+            echo "SUCCESS: HLS + WS URLs saved to Worker KV"
+            echo "Viewers can now load the stream!"
           else
-            echo "FAIL: HTTP $HTTP_STATUS"
+            echo "FAIL: Worker returned HTTP $HTTP_STATUS"
             exit 1
           fi
 
-      # ── 8. Keep alive (6 ชั่วโมง) ────────────────────────────
-      - name: Keep alive
+      - name: Keep alive (max 6 hours)
         run: |
-          echo "Stream running — will keep alive for up to 6 hours"
+          echo "Stream is LIVE — keeping runner alive..."
           for i in $(seq 1 720); do
             sleep 30
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "$((i/2)) min elapsed"
-              tail -2 /tmp/ffmpeg.log 2>/dev/null || true
+            if [ $((i % 20)) -eq 0 ]; then
+              echo "=== $((i/2)) min elapsed ==="
+              tail -3 /tmp/ffmpeg.log 2>/dev/null || true
             fi
           done
