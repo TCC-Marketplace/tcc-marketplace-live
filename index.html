@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>🔴 LIVE – TCC Marketplace</title>
+<link rel="icon" href="data:,">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
@@ -782,6 +783,32 @@ let streamLive = false;
 let hlsInstance = null; // track HLS instance for clean re-init
 
 // ─────────────────────────────────────────
+// WORKER POLL FALLBACK
+// ถ้า Firebase ไม่ส่ง hlsUrl มา → poll Worker โดยตรง
+// ─────────────────────────────────────────
+const WORKER_URL = 'https://tcc-marketplace-live.tcc-team-developer.workers.dev';
+let workerPollInterval = null;
+
+function startWorkerPoll() {
+  if (workerPollInterval) return; // ไม่ poll ซ้ำ
+  console.log('[TCC] Worker poll started...');
+  workerPollInterval = setInterval(async () => {
+    try {
+      const res  = await fetch(WORKER_URL + '/hls-url');
+      const data = await res.json();
+      if (data.ready && data.hls_url) {
+        clearInterval(workerPollInterval);
+        workerPollInterval = null;
+        CONFIG.hlsUrl = data.hls_url;
+        console.log('[TCC] Worker poll: HLS ready → initPlayer');
+        document.getElementById('offlineScreen').style.display = 'none';
+        initPlayer();
+      }
+    } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
+  }, 5000);
+}
+
+// ─────────────────────────────────────────
 // HLS PLAYER
 // ─────────────────────────────────────────
 function initPlayer() {
@@ -790,7 +817,15 @@ function initPlayer() {
 
   if (!CONFIG.hlsUrl) {
     offline.style.display = 'flex';
+    // เริ่ม poll Worker เพื่อรอ stream (fallback กรณี Firebase ช้า)
+    startWorkerPoll();
     return;
+  }
+
+  // หยุด poll ถ้า stream เริ่มได้แล้ว
+  if (workerPollInterval) {
+    clearInterval(workerPollInterval);
+    workerPollInterval = null;
   }
 
   // destroy existing HLS instance before re-init
@@ -853,6 +888,8 @@ function initFirebase() {
       // isLive ถูก set เป็น false → ล้าง player แสดง offline screen
       if (d.isLive === false) {
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        // หยุด Worker poll ถ้า Admin หยุด live
+        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
         streamLive = false;
         const offline = document.getElementById('offlineScreen');
         if (offline) offline.style.display = 'flex';
@@ -885,6 +922,8 @@ function initFirebase() {
         // URL เปลี่ยน หรือเพิ่งได้รับครั้งแรก → (re-)init player
         const changed = CONFIG.hlsUrl !== info.hlsUrl;
         CONFIG.hlsUrl = info.hlsUrl;
+        // Firebase ส่งมาแล้ว → หยุด Worker poll (ไม่ต้อง poll ซ้ำ)
+        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
         if (changed || !streamLive) {
           initPlayer();
         }
