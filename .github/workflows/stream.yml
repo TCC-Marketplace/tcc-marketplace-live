@@ -33,20 +33,40 @@ jobs:
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
 
-      - name: Start Tunnel and print URLs
+      - name: Start Tunnel and POST HLS URL to Worker
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
-          sleep 10
+          sleep 15
+
           CF_URL=$(grep -o 'https://[a-z0-9\-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
           PUBLIC_IP=$(curl -s https://api.ipify.org)
+          HLS_URL="$CF_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
+
           echo "========================================"
           echo " OBS RTMP  : rtmp://$PUBLIC_IP/live"
           echo " Stream Key: ${{ github.event.inputs.stream_key }}"
-          echo " HLS URL   : $CF_URL/hls/${{ github.event.inputs.stream_key }}.m3u8"
+          echo " HLS URL   : $HLS_URL"
           echo "========================================"
-          echo "1. ใส่ RTMP URL ใน OBS แล้ว Start Streaming"
-          echo "2. ใส่ HLS URL ใน TCC Admin แล้วกด บันทึก"
-          echo "3. กด เริ่ม Live"
+
+          # ── POST HLS URL ไปที่ Cloudflare Worker ──────────────
+          HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
+            -X POST "${WORKER_URL}/hls-url" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+            -d "{\"hls_url\": \"$HLS_URL\"}")
+
+          echo "Worker response (HTTP $HTTP_STATUS):"
+          cat /tmp/worker_res.txt
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ HLS URL ส่งถึง Worker KV แล้ว — Admin poll จะเจอใน ~5 วินาที"
+          else
+            echo "❌ POST ล้มเหลว HTTP $HTTP_STATUS — ตรวจ WORKER_URL และ ADMIN_SECRET secrets"
+            exit 1
+          fi
 
       - name: Keep alive
         run: sleep 21600
