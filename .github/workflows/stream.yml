@@ -80,14 +80,43 @@ jobs:
       - name: Start WebSocket ingestion
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
-          ./websocat -b --binary ws-l:0.0.0.0:9001 - | \
-            ffmpeg -loglevel warning \
-              -f webm -i pipe:0 \
-              -c:v libx264 -preset ultrafast -tune zerolatency \
-              -c:a aac -ar 44100 \
-              -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
+
+          # ── เปิด websocat รับ WebSocket → pipe ไป ffmpeg ───
+          # แยก process ออกจากกัน: websocat เขียน stdout → ffmpeg อ่าน stdin
+          # ใช้ named pipe (FIFO) เพื่อให้ทั้งคู่ background ได้อิสระ
+          mkfifo /tmp/ws_pipe
+
+          # ffmpeg รออ่าน FIFO (block จนมี data) — background ก่อน
+          ffmpeg -loglevel warning \
+            -f webm -i /tmp/ws_pipe \
+            -c:v libx264 -preset ultrafast -tune zerolatency \
+            -c:a aac -ar 44100 \
+            -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
             > /tmp/ffmpeg.log 2>&1 &
-          echo "WebSocket ingestion started on port 9001"
+          FFMPEG_PID=$!
+
+          # websocat bind port 9001 → เขียนลง FIFO — background
+          ./websocat -b --binary ws-l:0.0.0.0:9001 - > /tmp/ws_pipe &
+          WS_PID=$!
+
+          echo "websocat PID=$WS_PID, ffmpeg PID=$FFMPEG_PID"
+
+          # ── รอ port 9001 พร้อม (max 15s) ─────────────────
+          echo "Waiting for port 9001 to be ready..."
+          for i in $(seq 1 15); do
+            if nc -z 127.0.0.1 9001 2>/dev/null; then
+              echo "Port 9001 ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          # ตรวจ process ยังอยู่ไหม
+          if ! kill -0 $WS_PID 2>/dev/null; then
+            echo "ERROR: websocat exited unexpectedly"
+            exit 1
+          fi
+          echo "WebSocket ingestion ready on port 9001"
 
       - name: Install Cloudflare Tunnel
         run: |
@@ -173,6 +202,12 @@ jobs:
           echo "HLS_URL = $HLS_URL"
           echo "WS_URL  = $WS_URL"
 
+          # ── ตรวจ local service ยังทำงานอยู่ไหม ─────────────
+          echo "=== Service health check ==="
+          nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx/HLS): OK" || echo "Port 8080: NOT READY ⚠️"
+          nc -z 127.0.0.1 9001 && echo "Port 9001 (websocat):  OK" || echo "Port 9001: NOT READY ⚠️"
+          nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):      OK" || echo "Port 1935: NOT READY ⚠️"
+
           # ── POST URLs ไปยัง Cloudflare Worker KV ────────────
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
@@ -200,5 +235,8 @@ jobs:
             if [ $((i % 20)) -eq 0 ]; then
               echo "=== $((i/2)) min elapsed ==="
               tail -3 /tmp/ffmpeg.log 2>/dev/null || true
+              # ── watchdog: ตรวจ service ยังทำงานอยู่ ──────
+              nc -z 127.0.0.1 9001 || echo "⚠️ port 9001 down"
+              nc -z 127.0.0.1 8080 || echo "⚠️ port 8080 down"
             fi
           done
