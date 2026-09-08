@@ -1317,14 +1317,26 @@ async function blStartScreen() {
 }
 
 // ── Trigger GitHub Actions ─────────────────────────────────
-// แก้ไข: เพิ่ม validation, error detail, และ retry 1 ครั้ง
 async function blTriggerGitHubActions() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
 
-  // ตรวจว่า Worker URL ถูกตั้งค่าแล้ว
   if (!proxyUrl || proxyUrl.includes('YOUR_WORKER')) {
     blLog('❌ ยังไม่ได้ตั้งค่า proxyUrl ใน ADMIN_CONFIG');
     return false;
+  }
+
+  // ── Step 0: clear URL เก่าออกจาก KV ก่อน trigger ──────
+  // ป้องกัน Admin/Viewer เห็น tunnel URL รอบก่อนที่หมดอายุแล้ว
+  blLog('กำลังล้าง URL เก่า...');
+  try {
+    await fetch(proxyUrl + '/clear-url', {
+      method: 'POST',
+      headers: { 'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '' },
+    });
+    addLog('🧹 ล้าง KV URL เก่าแล้ว');
+  } catch (_) {
+    // Worker อาจยังไม่มี /clear-url → ไม่ block การ trigger
+    addLog('⚠️ /clear-url ไม่ตอบ — ข้ามไป');
   }
 
   blLog('กำลัง trigger GitHub Actions...');
@@ -1338,17 +1350,15 @@ async function blTriggerGitHubActions() {
       },
       body: JSON.stringify({ stream_key: ADMIN_CONFIG.streamKeyReal || 'stream_tcc' }),
     });
-
     let data = {};
     try { data = await res.json(); } catch (_) {}
-
     return { res, data };
   };
 
   try {
     let { res, data } = await doTrigger();
 
-    // ถ้า 502 (GitHub 422) → รอ 3 วินาที แล้ว retry 1 ครั้ง
+    // 502 = GitHub 422 (workflow already running) → รอแล้ว retry
     if (res.status === 502 && !data.ok) {
       blLog('Worker ตอบ 502 — retry ใน 3 วินาที...');
       await new Promise(r => setTimeout(r, 3000));
@@ -1360,7 +1370,6 @@ async function blTriggerGitHubActions() {
       return true;
     }
 
-    // แสดง error detail เพื่อ debug ง่ายขึ้น
     const detail = data.detail ? ` (${data.detail.substring(0, 80)})` : '';
     blLog(`❌ Worker error: ${data.error || res.status}${detail}`);
     addLog(`Worker error detail: HTTP ${res.status} — ${JSON.stringify(data)}`);
