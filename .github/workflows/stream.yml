@@ -103,49 +103,67 @@ jobs:
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # ตรวจสอบ WORKER_URL secret ก่อน
+          # ── ตรวจสอบ secret ──────────────────────────────────
           if [ -z "$WORKER_URL" ]; then
-            echo "ERROR: WORKER_URL secret is not set in GitHub Secrets!"
-            echo "ไปที่: repo Settings → Secrets → Actions → New repository secret"
-            echo "Name: WORKER_URL"
-            echo "Value: https://tcc-marketplace-live.tcc-team-developer.workers.dev"
+            echo "ERROR: WORKER_URL secret is not set!"
             exit 1
           fi
 
-          # เปิด HLS tunnel (port 8080 → Nginx)
+          # ── เปิด HLS tunnel (port 8080 → Nginx) ─────────────
+          # cloudflared ≥2024 ส่ง URL ไปที่ stderr → redirect 2>&1
+          # แยก log file ก่อน background เพื่อให้ shell buffer flush ถูกต้อง
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
-            2>&1 | tee /tmp/cf_hls.log &
+            > /tmp/cf_hls.log 2>&1 &
           CF_HLS_PID=$!
 
-          # เปิด WS tunnel (port 9001 → websocat)
+          # ── เปิด WS tunnel (port 9001 → websocat) ───────────
           ./cloudflared tunnel --url http://localhost:9001 --no-autoupdate \
-            2>&1 | tee /tmp/cf_ws.log &
+            > /tmp/cf_ws.log 2>&1 &
           CF_WS_PID=$!
 
-          echo "Waiting 35s for tunnels to initialize..."
-          sleep 35
+          echo "Tunnels started (PIDs: $CF_HLS_PID $CF_WS_PID) — waiting 40s..."
+          sleep 40
 
-          # ดึง URL — cloudflared ≥2024 log ไปที่ stdout
-          HLS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_hls.log | head -1)
-          WS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ws.log | head -1)
+          # ── ดึง URL จาก log ──────────────────────────────────
+          # cloudflared ≥2024 print: "Your quick Tunnel has been created! Visit it at (it's currently disabled):"
+          # แล้วตามด้วย URL บรรทัดถัดไป หรือ inline ใน pattern เดิม
+          extract_url() {
+            local logfile="$1"
+            # pattern 1: trycloudflare URL ตรงๆ
+            local url
+            url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$logfile" | head -1)
+            if [ -z "$url" ]; then
+              # pattern 2: cloudflared v2024+ print URL หลัง "| " หรือหลัง "Visit it at"
+              url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$logfile" | head -1)
+            fi
+            echo "$url"
+          }
 
-          echo "=== cf_hls.log (last 10 lines) ==="
-          tail -10 /tmp/cf_hls.log || true
-          echo "=== cf_ws.log (last 10 lines) ==="
-          tail -10 /tmp/cf_ws.log || true
+          HLS_CF=$(extract_url /tmp/cf_hls.log)
+          WS_CF=$(extract_url /tmp/cf_ws.log)
+
+          echo "=== cf_hls.log (last 15 lines) ==="
+          tail -15 /tmp/cf_hls.log || true
+          echo "=== cf_ws.log (last 15 lines) ==="
+          tail -15 /tmp/cf_ws.log || true
           echo "HLS tunnel URL: $HLS_CF"
           echo "WS  tunnel URL: $WS_CF"
 
+          # ── retry ถ้ายังไม่ได้ URL ──────────────────────────
           if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
-            echo "ERROR: ไม่พบ tunnel URL — cloudflared อาจยังไม่พร้อม รอเพิ่มอีก 30s..."
+            echo "URL ยังไม่มา — รอเพิ่ม 30s แล้ว retry..."
             sleep 30
-            HLS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_hls.log | head -1)
-            WS_CF=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ws.log | head -1)
+            HLS_CF=$(extract_url /tmp/cf_hls.log)
+            WS_CF=$(extract_url /tmp/cf_ws.log)
             echo "Retry — HLS: $HLS_CF | WS: $WS_CF"
           fi
 
           if [ -z "$HLS_CF" ] || [ -z "$WS_CF" ]; then
-            echo "FATAL: tunnel URL ยังไม่มา — ยกเลิก"
+            echo "FATAL: ไม่พบ tunnel URL หลังรอ 70s"
+            echo "=== Full cf_hls.log ==="
+            cat /tmp/cf_hls.log || true
+            echo "=== Full cf_ws.log ==="
+            cat /tmp/cf_ws.log || true
             exit 1
           fi
 
@@ -155,7 +173,7 @@ jobs:
           echo "HLS_URL = $HLS_URL"
           echo "WS_URL  = $WS_URL"
 
-          # POST URLs ไปยัง Cloudflare Worker KV
+          # ── POST URLs ไปยัง Cloudflare Worker KV ────────────
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
