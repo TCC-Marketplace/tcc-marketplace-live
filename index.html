@@ -788,24 +788,54 @@ let hlsInstance = null; // track HLS instance for clean re-init
 // ─────────────────────────────────────────
 const WORKER_URL = 'https://tcc-marketplace-live.tcc-team-developer.workers.dev';
 let workerPollInterval = null;
+let hlsRetryCount = 0;         // นับจำนวนครั้งที่ HLS.js fatal → ต้อง restart poll
+const HLS_RETRY_MAX = 20;      // retry HLS สูงสุด 20 ครั้ง × 5s = 100s
 
 function startWorkerPoll() {
   if (workerPollInterval) return; // ไม่ poll ซ้ำ
   console.log('[TCC] Worker poll started...');
   workerPollInterval = setInterval(async () => {
     try {
-      const res  = await fetch(WORKER_URL + '/hls-url');
+      const res  = await fetch(WORKER_URL + '/hls-url', { cache: 'no-store' });
       const data = await res.json();
       if (data.ready && data.hls_url) {
-        clearInterval(workerPollInterval);
-        workerPollInterval = null;
-        CONFIG.hlsUrl = data.hls_url;
-        console.log('[TCC] Worker poll: HLS ready → initPlayer');
-        document.getElementById('offlineScreen').style.display = 'none';
+        // ได้ URL มาแล้ว — แต่ยังไม่ clear interval ทันที
+        // รอให้ HLS.js ยืนยันว่าเล่นได้จริงก่อน (MANIFEST_PARSED)
+        // ถ้ายัง 404 อยู่ interval จะทำงานต่อ → retry initPlayer อีก 5s
+        if (CONFIG.hlsUrl !== data.hls_url) {
+          CONFIG.hlsUrl = data.hls_url;
+          console.log('[TCC] Worker poll: HLS URL received → initPlayer');
+        }
+        // เรียก initPlayer ทุก tick จนกว่าจะเล่นได้ (idempotent — destroy แล้ว re-init)
         initPlayer();
       }
     } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
   }, 5000);
+}
+
+// เรียกเมื่อ HLS.js ยืนยัน MANIFEST_PARSED = เล่นได้จริง → ค่อย stop poll
+function confirmHlsReady() {
+  if (workerPollInterval) {
+    clearInterval(workerPollInterval);
+    workerPollInterval = null;
+    hlsRetryCount = 0;
+    console.log('[TCC] HLS confirmed playing — poll stopped');
+  }
+}
+
+// เรียกเมื่อ HLS.js fatal error → restart poll ใหม่ (URL อาจเปลี่ยน หรือยัง 404)
+function restartWorkerPoll() {
+  hlsRetryCount++;
+  if (hlsRetryCount > HLS_RETRY_MAX) {
+    console.warn('[TCC] HLS retry limit reached — giving up');
+    return;
+  }
+  console.log(`[TCC] HLS fatal → restart poll (retry ${hlsRetryCount}/${HLS_RETRY_MAX})`);
+  // ถ้า poll หยุดอยู่ให้เริ่มใหม่
+  if (!workerPollInterval) {
+    startWorkerPoll();
+  }
+  // ถ้า poll ยังรัน → ปล่อย interval ทำงานต่อ (จะ call initPlayer ใน tick ถัดไป)
 }
 
 // ─────────────────────────────────────────
@@ -822,31 +852,53 @@ function initPlayer() {
     return;
   }
 
-  // หยุด poll ถ้า stream เริ่มได้แล้ว
-  if (workerPollInterval) {
-    clearInterval(workerPollInterval);
-    workerPollInterval = null;
-  }
-
-  // destroy existing HLS instance before re-init
+  // destroy existing HLS instance before re-init (idempotent)
   if (hlsInstance) {
     hlsInstance.destroy();
     hlsInstance = null;
   }
 
-  offline.style.display = 'none';
-  streamLive = true;
+  // ยังไม่ hide offline screen และยังไม่ set streamLive=true
+  // รอให้ MANIFEST_PARSED ยืนยันว่า .m3u8 โหลดสำเร็จก่อน
+  // (confirmHlsReady() จะ handle ทั้งสองอย่าง)
 
   if (Hls.isSupported()) {
-    hlsInstance = new Hls({ lowLatencyMode: true });
+    hlsInstance = new Hls({
+      lowLatencyMode:       true,
+      manifestLoadingMaxRetry:    6,   // retry manifest 6 ครั้งก่อน fatal
+      manifestLoadingRetryDelay: 1000, // รอ 1s ระหว่าง retry
+      levelLoadingMaxRetry:       4,
+      fragLoadingMaxRetry:        4,
+    });
     hlsInstance.loadSource(CONFIG.hlsUrl);
     hlsInstance.attachMedia(video);
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); });
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+      // .m3u8 โหลดสำเร็จ = stream พร้อมจริง → หยุด poll
+      confirmHlsReady();
+      streamLive = true;
+      offline.style.display = 'none';
+      video.play().catch(()=>{});
+    });
     hlsInstance.on(Hls.Events.ERROR, (e, data) => {
-      if (data.fatal) { offline.style.display = 'flex'; streamLive = false; }
+      if (data.fatal) {
+        console.warn('[TCC] HLS fatal error:', data.type, data.details);
+        // destroy instance เก่าก่อน
+        hlsInstance.destroy();
+        hlsInstance = null;
+        streamLive = false;
+        // ไม่แสดง offline screen ทันที — รอให้ retry ก่อน
+        // แสดง offline เฉพาะถ้า retry หมดแล้ว
+        if (hlsRetryCount >= HLS_RETRY_MAX) {
+          offline.style.display = 'flex';
+        }
+        // restart poll → จะเรียก initPlayer ใน tick ถัดไป (~5s)
+        restartWorkerPoll();
+      }
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS
     video.src = CONFIG.hlsUrl;
+    video.addEventListener('canplay', confirmHlsReady, { once: true });
     video.play().catch(()=>{});
   }
 }
@@ -922,8 +974,14 @@ function initFirebase() {
         // URL เปลี่ยน หรือเพิ่งได้รับครั้งแรก → (re-)init player
         const changed = CONFIG.hlsUrl !== info.hlsUrl;
         CONFIG.hlsUrl = info.hlsUrl;
-        // Firebase ส่งมาแล้ว → หยุด Worker poll (ไม่ต้อง poll ซ้ำ)
-        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
+        // reset retry counter เมื่อได้ URL ใหม่จาก Firebase
+        hlsRetryCount = 0;
+        // หยุด Worker poll เฉพาะถ้า HLS เล่นได้แล้ว (streamLive=true)
+        // ถ้ายังไม่ได้เล่น → ปล่อย poll ทำงานต่อเพื่อ retry
+        if (streamLive && workerPollInterval) {
+          clearInterval(workerPollInterval);
+          workerPollInterval = null;
+        }
         if (changed || !streamLive) {
           initPlayer();
         }
