@@ -1580,6 +1580,8 @@ function initShopFirebase() {
 initPlayer();
 initFirebase();
 renderProductStrip();
+// เริ่ม Worker poll ทันทีถ้ายังไม่มี hlsUrl (ไม่รอ Firebase)
+if (!CONFIG.hlsUrl) startWorkerPoll();
 // initShopFirebase() จะถูกเรียกหลัง initFirebase() สร้าง db
 </script>
 </body>
