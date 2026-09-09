@@ -1419,62 +1419,109 @@ function blPollForUrls() {
 }
 
 // ── MediaRecorder → WebSocket → ffmpeg ────────────────────
+// ⚠️  สำคัญ: ต้อง restart MediaRecorder ทุกครั้งที่เปิด WebSocket ใหม่
+// เพราะ WebM EBML header ส่งแค่ตอน MediaRecorder.start() เท่านั้น
+// ffmpeg spawn ใหม่ทุก connection → ต้องการ EBML header ใหม่ทุกครั้ง
+// ถ้าไม่ restart → ffmpeg ได้รับ video data โดยไม่มี header → ไม่เขียน .m3u8
+
+let blReconnectTimer = null;   // timer สำหรับ auto-reconnect
+let blReconnectCount = 0;      // นับจำนวนครั้ง reconnect
+const BL_RECONNECT_MAX = 10;   // สูงสุด 10 ครั้ง
+
+// เลือก MIME type ครั้งเดียว (reuse ระหว่าง reconnect)
+const BL_MIME = (() => {
+  const types = ['video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/webm'];
+  return types.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+})();
+
+function blStopRecorder() {
+  // หยุด MediaRecorder เก่าก่อน (ถ้ามี) — ไม่ throw ถ้า inactive
+  if (blRecorder) {
+    try {
+      if (blRecorder.state !== 'inactive') blRecorder.stop();
+    } catch (_) {}
+    blRecorder = null;
+  }
+}
+
+function blStartRecorder(ws) {
+  // เริ่ม MediaRecorder ใหม่ทุกครั้งที่ WebSocket เปิดสำเร็จ
+  // → ส่ง EBML header ใหม่ ทำให้ ffmpeg decode ได้จาก frame แรก
+  blStopRecorder();
+
+  blRecorder = new MediaRecorder(blStream, {
+    mimeType:           BL_MIME,
+    videoBitsPerSecond: 1500000,
+    audioBitsPerSecond: 128000,
+  });
+
+  blRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data);
+    }
+  };
+
+  blRecorder.onerror = (e) => {
+    blLog('MediaRecorder error: ' + (e.error?.message || 'unknown'));
+  };
+
+  // timeslice 500ms — ส่ง chunk ทุก 0.5s
+  blRecorder.start(500);
+  blLog('MediaRecorder เริ่มส่ง stream (MIME: ' + BL_MIME + ')');
+}
+
 function blStartStreaming() {
   if (!blStream || !blWsUrl) {
     blLog('ไม่มี stream หรือ WS URL');
     return;
   }
 
-  // เลือก codec ที่ browser รองรับ
-  const mimeTypes = [
-    'video/webm;codecs=vp8,opus',
-    'video/webm;codecs=vp9,opus',
-    'video/webm',
-  ];
-  const mime = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+  // ยกเลิก reconnect timer เก่าก่อน (ถ้ามี)
+  if (blReconnectTimer) { clearTimeout(blReconnectTimer); blReconnectTimer = null; }
 
-  blLog('กำลังเชื่อมต่อ WebSocket...');
+  blLog('กำลังเชื่อมต่อ WebSocket... (ครั้งที่ ' + (blReconnectCount + 1) + ')');
 
-  blWs = new WebSocket(blWsUrl);
-  blWs.binaryType = 'arraybuffer';
+  // ปิด WS เก่าถ้ายังเปิดอยู่
+  if (blWs) {
+    try { blWs.onclose = null; blWs.close(); } catch (_) {}
+    blWs = null;
+  }
 
-  blWs.onopen = () => {
+  const ws = new WebSocket(blWsUrl);
+  ws.binaryType = 'arraybuffer';
+  blWs = ws;
+
+  ws.onopen = () => {
+    blReconnectCount = 0;  // reset counter เมื่อเชื่อมสำเร็จ
     blLog('WebSocket เชื่อมต่อแล้ว — เริ่มส่ง stream!');
+    blSetStatus('กำลัง Live 🔴', 'live');
 
-    blRecorder = new MediaRecorder(blStream, {
-      mimeType:        mime,
-      videoBitsPerSecond: 1500000, // 1.5 Mbps
-      audioBitsPerSecond: 128000,
-    });
+    // ⚠️  restart MediaRecorder ทุกครั้ง เพื่อส่ง EBML header ใหม่ให้ ffmpeg ใหม่
+    blStartRecorder(ws);
 
-    blRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0 && blWs && blWs.readyState === WebSocket.OPEN) {
-        blWs.send(e.data);
-      }
-    };
-
-    blRecorder.onerror = (e) => {
-      blLog('MediaRecorder error: ' + e.error?.message);
-    };
-
-    // timeslice 500ms — ส่ง chunk ทุก 0.5 วินาที ให้ latency ต่ำ
-    blRecorder.start(500);
-
-    // หลัง stream ไปถึง Nginx ~10 วินาที HLS ควรพร้อม → update Firebase
+    // หลังส่ง stream ~10s → HLS ควรพร้อม → update Firebase
     setTimeout(blActivateFirebase, 10000);
   };
 
-  blWs.onerror = (e) => {
-    blLog('WebSocket error — ตรวจสอบ tunnel ว่า active อยู่ไหม');
-    blSetStatus('เกิดข้อผิดพลาด', '');
+  ws.onerror = () => {
+    blLog('WebSocket error — กำลัง reconnect...');
   };
 
-  blWs.onclose = () => {
-    // ถ้าปิด WebSocket ขณะ live อยู่ → แสดง warning
-    if (isStreaming) {
-      blLog('WebSocket ขาดการเชื่อมต่อ — stream หยุด');
+  ws.onclose = (evt) => {
+    blStopRecorder();
+
+    // ถ้า live ยังอยู่และยังไม่เกิน max retry → reconnect อัตโนมัติ
+    if (isStreaming && blWsUrl && blReconnectCount < BL_RECONNECT_MAX) {
+      blReconnectCount++;
+      const delay = Math.min(2000 * blReconnectCount, 10000); // backoff: 2s, 4s, ... 10s
+      blLog(`WebSocket ขาดการเชื่อมต่อ (code ${evt.code}) — reconnect ใน ${delay/1000}s (ครั้งที่ ${blReconnectCount}/${BL_RECONNECT_MAX})`);
+      blSetStatus('กำลัง reconnect...', '');
+      blReconnectTimer = setTimeout(() => blStartStreaming(), delay);
+    } else if (blReconnectCount >= BL_RECONNECT_MAX) {
+      blLog('WebSocket ขาดการเชื่อมต่อ — หมด retry แล้ว กรุณากด Live ใหม่');
       blSetStatus('ขาดการเชื่อมต่อ', '');
     }
+    // ถ้า !isStreaming = กด Stop เอง → ไม่ reconnect
   };
 }
 
@@ -1555,15 +1602,22 @@ async function blGoLive() {
 
 // ── หยุด Live ──────────────────────────────────────────────
 function blStopLive() {
+  // ยกเลิก auto-reconnect ก่อน (ต้องทำก่อน set isStreaming=false)
+  if (blReconnectTimer) { clearTimeout(blReconnectTimer); blReconnectTimer = null; }
+  blReconnectCount = 0;
+
   // หยุด MediaRecorder
-  if (blRecorder && blRecorder.state !== 'inactive') {
-    blRecorder.stop();
-    blRecorder = null;
+  blStopRecorder();
+
+  // ปิด WebSocket (onclose จะไม่ reconnect เพราะ isStreaming จะ=false)
+  if (blWs) {
+    try { blWs.onclose = null; blWs.close(); } catch (_) {}
+    blWs = null;
   }
-  // ปิด WebSocket
-  if (blWs) { blWs.close(); blWs = null; }
+
   // หยุด stream tracks
   if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
+
   // หยุด poll
   if (blPolling) { clearInterval(blPolling); blPolling = null; }
 
