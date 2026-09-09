@@ -153,163 +153,22 @@ jobs:
           nc -z 127.0.0.1 8080 && echo "Port 8080: READY" || echo "Port 8080: NOT READY"
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 4: Start ffmpeg + Node.js ingest server
-      #
-      # แก้ปัญหา Critical #1: socat + named pipe ทำให้ ffmpeg ได้ stream ขาดๆ
-      # เพราะแต่ละ POST = TCP connection ใหม่ → socat fork เขียน pipe ซ้อนกัน
-      #
-      # วิธีใหม่: Node.js HTTP ingest server (1 process ตลอด)
-      #   - รับ POST /ingest → drain request body ต่อเนื่องไปยัง ffmpeg stdin
-      #   - ffmpeg stdin = 1 process, 1 stream → ไม่ขาด
-      #   - แต่ละ POST chunk ถูก pipe เข้า ffmpeg.stdin โดยตรง (no fork, no race)
-      #
-      # Pipeline ใหม่:
-      #   Browser POST chunks → Nginx → Node.js :9002
-      #   → ffmpeg.stdin (process pipe, 1 connection) → RTMP → HLS
+      # STEP 4: Write ingest server script (base64 → avoid YAML heredoc issue)
+      # ─────────────────────────────────────────────────────────────
+      - name: Write Node.js ingest server
+        run: |
+          # เขียน ingest_server.js จาก base64 → หลีกเลี่ยง YAML heredoc syntax error
+          # (heredoc flush-left content ทำให้ YAML parser error)
+          echo 'Y29uc3QgaHR0cCA9IHJlcXVpcmUoJ2h0dHAnKTsKY29uc3QgeyBzcGF3biB9ID0gcmVxdWlyZSgnY2hpbGRfcHJvY2VzcycpOwoKY29uc3QgU1RSRUFNX0tFWSA9IHByb2Nlc3MuZW52LlNUUkVBTV9LRVkgfHwgJ3N0cmVhbV90Y2MnOwpjb25zdCBQT1JUID0gOTAwMjsKCmNvbnN0IGZmbXBlZyA9IHNwYXduKCdmZm1wZWcnLCBbCiAgJy1oaWRlX2Jhbm5lcicsICctbG9nbGV2ZWwnLCAnd2FybmluZycsCiAgJy1mJywgJ3dlYm0nLAogICctaScsICdwaXBlOjAnLAogICctYzp2JywgJ2xpYngyNjQnLAogICctcHJlc2V0JywgJ3VsdHJhZmFzdCcsCiAgJy10dW5lJywgJ3plcm9sYXRlbmN5JywKICAnLXgyNjQtcGFyYW1zJywgJ2tleWludD02MDptaW4ta2V5aW50PTYwOnNjZW5lY3V0PTAnLAogICctYzphJywgJ2FhYycsCiAgJy1hcicsICc0NDEwMCcsCiAgJy1iOmEnLCAnMTI4aycsCiAgJy1mJywgJ2ZsdicsCiAgYHJ0bXA6Ly8xMjcuMC4wLjEvbGl2ZS8ke1NUUkVBTV9LRVl9YApdLCB7IHN0ZGlvOiBbJ3BpcGUnLCAncGlwZScsICdwaXBlJ10gfSk7CgpmZm1wZWcuc3Rkb3V0Lm9uKCdkYXRhJywgZCA9PiBwcm9jZXNzLnN0ZG91dC53cml0ZSgnW2ZmbXBlZ10gJyArIGQpKTsKZmZtcGVnLnN0ZGVyci5vbignZGF0YScsIGQgPT4gcHJvY2Vzcy5zdGRlcnIud3JpdGUoJ1tmZm1wZWddICcgKyBkKSk7CmZmbXBlZy5vbignY2xvc2UnLCBjb2RlID0+IHsgY29uc29sZS5sb2coJ1tmZm1wZWddIGV4aXRlZCBjb2RlPScgKyBjb2RlKTsgcHJvY2Vzcy5leGl0KDEpOyB9KTsKZmZtcGVnLm9uKCdlcnJvcicsIGVyciA9PiB7IGNvbnNvbGUuZXJyb3IoJ1tmZm1wZWddIHNwYXduIGVycm9yOicsIGVyci5tZXNzYWdlKTsgcHJvY2Vzcy5leGl0KDEpOyB9KTsKCmxldCB3cml0aW5nID0gZmFsc2U7CmNvbnN0IHF1ZXVlID0gW107CmZ1bmN0aW9uIGRyYWluUXVldWUoKSB7CiAgaWYgKHdyaXRpbmcgfHwgcXVldWUubGVuZ3RoID09PSAwKSByZXR1cm47CiAgd3JpdGluZyA9IHRydWU7CiAgY29uc3QgY2h1bmsgPSBxdWV1ZS5zaGlmdCgpOwogIGNvbnN0IG9rID0gZmZtcGVnLnN0ZGluLndyaXRlKGNodW5rLCAoKSA9PiB7IHdyaXRpbmcgPSBmYWxzZTsgZHJhaW5RdWV1ZSgpOyB9KTsKICBpZiAoIW9rKSB7IGZmbXBlZy5zdGRpbi5vbmNlKCdkcmFpbicsICgpID0+IHsgd3JpdGluZyA9IGZhbHNlOyBkcmFpblF1ZXVlKCk7IH0pOyB9Cn0KCmxldCBjaHVua3NSZWNlaXZlZCA9IDA7CmxldCBieXRlc1JlY2VpdmVkICA9IDA7CmNvbnN0IHN0YXJ0ZWRBdCAgICA9IERhdGUubm93KCk7Cgpjb25zdCBzZXJ2ZXIgPSBodHRwLmNyZWF0ZVNlcnZlcigocmVxLCByZXMpID0+IHsKICByZXMuc2V0SGVhZGVyKCdBY2Nlc3MtQ29udHJvbC1BbGxvdy1PcmlnaW4nLCAgJyonKTsKICByZXMuc2V0SGVhZGVyKCdBY2Nlc3MtQ29udHJvbC1BbGxvdy1NZXRob2RzJywgJ1BPU1QsIEdFVCwgT1BUSU9OUycpOwogIHJlcy5zZXRIZWFkZXIoJ0FjY2Vzcy1Db250cm9sLUFsbG93LUhlYWRlcnMnLCAnKicpOwogIGlmIChyZXEubWV0aG9kID09PSAnT1BUSU9OUycpIHsgcmVzLndyaXRlSGVhZCgyMDQpOyByZXMuZW5kKCk7IHJldHVybjsgfQoKICBpZiAocmVxLm1ldGhvZCA9PT0gJ0dFVCcgJiYgcmVxLnVybCA9PT0gJy9zdGF0dXMnKSB7CiAgICBjb25zdCB1cHRpbWUgPSBNYXRoLmZsb29yKChEYXRlLm5vdygpIC0gc3RhcnRlZEF0KSAvIDEwMDApOwogICAgY29uc3QgYWxpdmUgID0gZmZtcGVnICYmICFmZm1wZWcua2lsbGVkICYmIGZmbXBlZy5leGl0Q29kZSA9PT0gbnVsbDsKICAgIHJlcy53cml0ZUhlYWQoYWxpdmUgPyAyMDAgOiA1MDMsIHsgJ0NvbnRlbnQtVHlwZSc6ICdhcHBsaWNhdGlvbi9qc29uJyB9KTsKICAgIHJlcy5lbmQoSlNPTi5zdHJpbmdpZnkoeyByZWFkeTogYWxpdmUsIGZmbXBlZ19waWQ6IGZmbXBlZyA/IGZmbXBlZy5waWQgOiBudWxsLAogICAgICBmZm1wZWdfYWxpdmU6IGFsaXZlLCBxdWV1ZV9sZW5ndGg6IHF1ZXVlLmxlbmd0aCwKICAgICAgY2h1bmtzX3JlY2VpdmVkOiBjaHVua3NSZWNlaXZlZCwgYnl0ZXNfcmVjZWl2ZWQ6IGJ5dGVzUmVjZWl2ZWQsIHVwdGltZV9zZWNvbmRzOiB1cHRpbWUgfSkpOwogICAgcmV0dXJuOwogIH0KCiAgaWYgKHJlcS5tZXRob2QgIT09ICdQT1NUJykgeyByZXMud3JpdGVIZWFkKDQwNSk7IHJlcy5lbmQoJ01ldGhvZCBOb3QgQWxsb3dlZCcpOyByZXR1cm47IH0KCiAgY29uc3QgY2h1bmtzID0gW107CiAgcmVxLm9uKCdkYXRhJywgZCA9PiBjaHVua3MucHVzaChkKSk7CiAgcmVxLm9uKCdlbmQnLCAoKSA9PiB7CiAgICBjb25zdCBib2R5ID0gQnVmZmVyLmNvbmNhdChjaHVua3MpOwogICAgaWYgKGJvZHkubGVuZ3RoID4gMCkgeyBjaHVua3NSZWNlaXZlZCsrOyBieXRlc1JlY2VpdmVkICs9IGJvZHkubGVuZ3RoOyBxdWV1ZS5wdXNoKGJvZHkpOyBkcmFpblF1ZXVlKCk7IH0KICAgIHJlcy53cml0ZUhlYWQoMjAwKTsgcmVzLmVuZCgnb2snKTsKICB9KTsKICByZXEub24oJ2Vycm9yJywgZXJyID0+IHsgY29uc29sZS5lcnJvcignW2luZ2VzdF0gcmVxIGVycm9yOicsIGVyci5tZXNzYWdlKTsgcmVzLndyaXRlSGVhZCg1MDApOyByZXMuZW5kKCk7IH0pOwp9KTsKCnNlcnZlci5saXN0ZW4oUE9SVCwgJzEyNy4wLjAuMScsICgpID0+IHsKICBjb25zb2xlLmxvZygnW2luZ2VzdF0gc2VydmVyIGxpc3RlbmluZyBvbiBwb3J0ICcgKyBQT1JUKTsKICBjb25zb2xlLmxvZygnW2luZ2VzdF0gZmZtcGVnIFBJRD0nICsgZmZtcGVnLnBpZCk7Cn0pOwpzZXJ2ZXIub24oJ2Vycm9yJywgZXJyID0+IHsgY29uc29sZS5lcnJvcignW2luZ2VzdF0gc2VydmVyIGVycm9yOicsIGVyci5tZXNzYWdlKTsgcHJvY2Vzcy5leGl0KDEpOyB9KTsKcHJvY2Vzcy5vbignU0lHVEVSTScsICgpID0+IHsgY29uc29sZS5sb2coJ1tpbmdlc3RdIFNJR1RFUk0nKTsgZmZtcGVnLnN0ZGluLmVuZCgpOyBzZXJ2ZXIuY2xvc2UoKTsgfSk7Cg==' | base64 -d > /tmp/ingest_server.js
+          echo "ingest_server.js written ($(wc -c < /tmp/ingest_server.js) bytes)"
+          node --check /tmp/ingest_server.js && echo "Node.js syntax OK" || { echo "Node.js syntax ERROR"; exit 1; }
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 5: Start ffmpeg + Node.js ingest server
       # ─────────────────────────────────────────────────────────────
       - name: Start ffmpeg and Node.js ingest server
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
-
-          # ── เขียน Node.js ingest server ──────────────────────────
-          cat > /tmp/ingest_server.js << 'NODE_EOF'
-const http = require('http');
-const { spawn } = require('child_process');
-
-const STREAM_KEY = process.env.STREAM_KEY || 'stream_tcc';
-const PORT = 9002;
-
-// ── เริ่ม ffmpeg process ─────────────────────────────────
-// stdin = readable stream จาก ingest server (continuous)
-// ไม่ใช้ named pipe → ไม่มี race condition จาก multi-POST
-const ffmpeg = spawn('ffmpeg', [
-  '-hide_banner', '-loglevel', 'warning',
-  '-f', 'webm',
-  '-i', 'pipe:0',                    // stdin ← Node.js pipe
-  '-c:v', 'libx264',
-  '-preset', 'ultrafast',
-  '-tune', 'zerolatency',
-  '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
-  '-c:a', 'aac',
-  '-ar', '44100',
-  '-b:a', '128k',
-  '-f', 'flv',
-  `rtmp://127.0.0.1/live/${STREAM_KEY}`
-], {
-  stdio: ['pipe', 'pipe', 'pipe']
-});
-
-ffmpeg.stdout.on('data', d => process.stdout.write('[ffmpeg] ' + d));
-ffmpeg.stderr.on('data', d => process.stderr.write('[ffmpeg] ' + d));
-ffmpeg.on('close', code => {
-  console.log(`[ffmpeg] exited code=${code}`);
-  // ffmpeg ตาย → ออก process ให้ watchdog restart
-  process.exit(1);
-});
-
-ffmpeg.on('error', err => {
-  console.error('[ffmpeg] spawn error:', err.message);
-  process.exit(1);
-});
-
-// ── Chunk queue + serial writer ──────────────────────────
-// แก้ปัญหา: หลาย POST มาพร้อมกัน → เขียน stdin พร้อมกัน backpressure crash
-// วิธีแก้: queue chunks, drain หนึ่ง chunk ต่อครั้ง
-let writing = false;
-const queue = [];
-
-function drainQueue() {
-  if (writing || queue.length === 0) return;
-  writing = true;
-  const chunk = queue.shift();
-  const ok = ffmpeg.stdin.write(chunk, () => {
-    writing = false;
-    drainQueue();
-  });
-  // ถ้า backpressure → รอ drain event
-  if (!ok) {
-    ffmpeg.stdin.once('drain', () => {
-      writing = false;
-      drainQueue();
-    });
-  }
-}
-
-// ── Stats counters ───────────────────────────────────────
-let chunksReceived = 0;
-let bytesReceived  = 0;
-const startedAt    = Date.now();
-
-// ── HTTP ingest server ───────────────────────────────────
-const server = http.createServer((req, res) => {
-  // CORS headers — ทุก request รวมถึง error response
-  res.setHeader('Access-Control-Allow-Origin',  '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204); res.end(); return;
-  }
-
-  // ── GET /status — ingest pipeline health check ─────────
-  // ใช้โดย Nginx /ingest-status → admin.html poll ก่อนส่ง chunk
-  if (req.method === 'GET' && req.url === '/status') {
-    const uptime = Math.floor((Date.now() - startedAt) / 1000);
-    const ffmpegAlive = ffmpeg && !ffmpeg.killed && ffmpeg.exitCode === null;
-    res.writeHead(ffmpegAlive ? 200 : 503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ready:          ffmpegAlive,
-      ffmpeg_pid:     ffmpeg ? ffmpeg.pid : null,
-      ffmpeg_alive:   ffmpegAlive,
-      queue_length:   queue.length,
-      chunks_received: chunksReceived,
-      bytes_received:  bytesReceived,
-      uptime_seconds:  uptime,
-    }));
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    res.writeHead(405); res.end('Method Not Allowed'); return;
-  }
-
-  // ── POST /ingest — รับ chunk → queue → ffmpeg stdin ────
-  const chunks = [];
-  req.on('data', d => chunks.push(d));
-  req.on('end', () => {
-    const body = Buffer.concat(chunks);
-    if (body.length > 0) {
-      chunksReceived++;
-      bytesReceived += body.length;
-      queue.push(body);
-      drainQueue();
-    }
-    // ตอบ 200 ทันทีหลัง enqueue (ไม่รอ ffmpeg write)
-    res.writeHead(200); res.end('ok');
-  });
-  req.on('error', err => {
-    console.error('[ingest] req error:', err.message);
-    res.writeHead(500); res.end();
-  });
-});
-
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[ingest] server listening on port ${PORT}`);
-  console.log(`[ingest] ffmpeg PID=${ffmpeg.pid}`);
-});
-
-server.on('error', err => {
-  console.error('[ingest] server error:', err.message);
-  process.exit(1);
-});
-
-// graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('[ingest] SIGTERM → closing');
-  ffmpeg.stdin.end();
-  server.close();
-});
-NODE_EOF
 
           # รัน Node.js ingest server (background)
           STREAM_KEY="${STREAM_KEY}" node /tmp/ingest_server.js > /tmp/ingest.log 2>&1 &
