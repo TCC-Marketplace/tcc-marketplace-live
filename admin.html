@@ -1507,11 +1507,36 @@ async function blSendChunk(blob) {
   }
 }
 
-function blStartStreaming() {
+// Fix #4: ตรวจ ingest pipeline พร้อมก่อน start MediaRecorder
+// poll GET /ingest-status จนได้ ready=true (max 20s) แล้วค่อย start
+async function blWaitIngestReady(ingestUrl) {
+  const statusUrl = ingestUrl.replace(/\/ingest$/, '/ingest-status');
+  const MAX = 10; // 10 × 2s = 20s
+  for (let i = 0; i < MAX; i++) {
+    try {
+      const res  = await fetch(statusUrl, { cache: 'no-store' });
+      const data = await res.json();
+      if (data.ready) {
+        blLog(`✅ Ingest pipeline พร้อม (ffmpeg PID=${data.ffmpeg_pid})`);
+        return true;
+      }
+    } catch (_) {}
+    blLog(`⏳ รอ ingest pipeline... (${i + 1}/${MAX})`);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  blLog('⚠️ Ingest pipeline ไม่ตอบสนอง — ลองส่ง chunk ต่อ (graceful fallback)');
+  return false; // graceful: ส่งต่อไปเลยแม้ไม่ ready
+}
+
+async function blStartStreaming() {
   if (!blStream || !blIngestUrl) {
     blLog('ไม่มี stream หรือ ingest URL');
     return;
   }
+
+  // Fix #4: รอ ingest pipeline พร้อมก่อน (ป้องกัน 502 chunk ชุดแรก)
+  blLog('ตรวจสอบ ingest pipeline...');
+  await blWaitIngestReady(blIngestUrl);
 
   blLog('เริ่ม MediaRecorder → HTTP POST streaming...');
   blStopRecorder();
@@ -1585,7 +1610,9 @@ async function blActivateFirebase() {
     const desc  = document.getElementById('streamDescInput')?.value  || '';
 
     if (db) {
-      await db.ref('streamInfo').set({ title, desc, hlsUrl: blHlsUrl });
+      // Fix #3: ใช้ update() แทน set() เพื่อไม่ทับ serverReady/ingestUrl
+      // ที่ Worker /firebase-update เขียนไว้แล้ว
+      await db.ref('streamInfo').update({ title, desc, hlsUrl: blHlsUrl });
       await db.ref('liveStats/isLive').set(true);
       blLog('✅ สมาชิกเห็นภาพแล้ว! (Firebase + Worker KV)');
       addLog('✅ Firebase อัปเดตแล้ว — viewer เห็นภาพ');
