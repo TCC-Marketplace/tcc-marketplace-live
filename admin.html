@@ -595,14 +595,12 @@
 // ─────────────────────────────────────────
 // CONFIG – แก้ตรงนี้
 // ─────────────────────────────────────────
-// ⚠️ SECURITY: adminSecret ใน code นี้เปิดเผยต่อทุกคนที่ view-source ได้
-// ควรโหลด secret จาก URL parameter หรือ prompt แทนการ hardcode
-// เช่น: const adminSecret = new URLSearchParams(location.search).get('s') || 'default'
+// SECURITY: โหลด adminSecret จาก URL parameter ?s=xxx ก่อน (ไม่ hardcode ใน source)
+// เข้าใช้งาน: admin.html?s=tcc2024secret
+// ถ้าไม่ส่ง ?s= มา จะ fallback ใช้ค่าด้านล่าง (ปรับได้)
 const ADMIN_CONFIG = {
   rtmpServer: 'rtmp://YOUR_SERVER_IP/live',
-  // TODO: เปลี่ยนจาก hardcode → โหลดจาก ?s= URL parameter
-  // adminSecret: new URLSearchParams(location.search).get('s') || 'tcc2024secret'
-  adminSecret: 'tcc2024secret',
+  adminSecret: new URLSearchParams(location.search).get('s') || 'tcc2024secret',
   github: {
     // Token ถูกย้ายไปเก็บใน Cloudflare Worker แล้ว (ปลอดภัย)
     proxyUrl: 'https://tcc-marketplace-live.tcc-team-developer.workers.dev',
@@ -741,11 +739,9 @@ function toggleStream() {
 }
 
 function startStream() {
-  // เปิด panel แล้วเรียก blGoLive อัตโนมัติ
-  const panel = document.getElementById('browserLivePanel');
-  if (panel) panel.classList.add('visible');
+  // One-click Live: ข้าม panel popup — เรียก blGoLive โดยตรง
+  // blGoLive จะขอสิทธิ์กล้อง + trigger GitHub Actions ให้อัตโนมัติ
   addLog('📡 กดไลฟ์ — เปิดกล้องและเริ่ม server อัตโนมัติ');
-  // เรียก blGoLive ทันที (blGoLive จะขอกล้องเองถ้ายังไม่มี)
   if (typeof blGoLive === 'function') blGoLive();
 }
 
@@ -762,13 +758,20 @@ function endStream() {
   document.getElementById('streamDuration').textContent = '';
   document.getElementById('goLiveBtn').textContent = '🔴 เริ่ม Live';
   document.getElementById('goLiveBtn').classList.remove('streaming');
-  // แก้ Bug #9: endStream() เป็น single source of truth สำหรับ Firebase write
-  // blStopLive() จะ stop recorder/tracks แต่ไม่ write Firebase ซ้ำ
+  // Firebase: clear isLive + hlsUrl ทันที
   if (db) {
     db.ref('liveStats/isLive').set(false);
     db.ref('liveStats/serverReady').set(false);
     db.ref('streamInfo/hlsUrl').remove();
     db.ref('streamInfo/serverReady').set(false);
+  }
+  // ล้าง Worker KV ด้วย — ป้องกัน Viewer poll เจอ URL เก่าหลัง stream จบ
+  const proxyUrl = (ADMIN_CONFIG.github || {}).proxyUrl || '';
+  if (proxyUrl && !proxyUrl.includes('YOUR_WORKER')) {
+    fetch(proxyUrl + '/clear-url', {
+      method:  'POST',
+      headers: { 'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '' },
+    }).catch(() => {}); // fire-and-forget
   }
   // หยุด Browser Panel (media tracks) โดยไม่ให้ write Firebase ซ้ำ
   if (typeof blStopLiveMediaOnly === 'function') blStopLiveMediaOnly();
@@ -1219,37 +1222,33 @@ initShopAdmin();
      BROWSER LIVE — WebRTC + GitHub Actions Auto-Trigger
 ═══════════════════════════════════════════════════════ -->
 <style>
+/* Browser Live — status bar (ซ่อนตลอด ไม่ popup แล้ว) */
+#browserLiveToggle { display:none !important; } /* ซ่อน FAB — ใช้ปุ่ม goLiveBtn แทน */
 #browserLivePanel {
   position:fixed; bottom:0; left:0; right:0; z-index:9999;
   background:#0a0a0a; border-top:2px solid #ff2d55;
-  padding:12px 16px; display:none;
+  padding:10px 16px; display:none;
   box-shadow:0 -4px 24px rgba(255,45,85,.3);
 }
 #browserLivePanel.visible { display:block; }
 .bl-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.bl-preview { width:160px; height:90px; background:#111; border-radius:8px; object-fit:cover; border:1px solid #333; }
+.bl-preview { width:120px; height:68px; background:#111; border-radius:8px; object-fit:cover; border:1px solid #333; }
 .bl-status { flex:1; min-width:120px; }
 .bl-status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#555; margin-right:6px; }
 .bl-status-dot.live { background:#ff2d55; animation:blink 1s infinite; }
 .bl-status-dot.ready { background:#30d158; }
-.bl-btn { padding:8px 18px; border-radius:20px; border:none; cursor:pointer; font-weight:700; font-size:13px; }
+.bl-btn { padding:6px 14px; border-radius:20px; border:none; cursor:pointer; font-weight:700; font-size:12px; }
 .bl-btn-cam { background:#1c1c1e; color:#fff; border:1px solid #333; }
 .bl-btn-screen { background:#1c1c1e; color:#fff; border:1px solid #333; }
-.bl-btn-go { background:#ff2d55; color:#fff; }
-.bl-btn-go:disabled { background:#444; cursor:not-allowed; }
-.bl-btn-stop { background:#ff3b30; color:#fff; display:none; }
-.bl-log { font-size:11px; color:#888; margin-top:6px; height:32px; overflow:hidden; }
+/* blGoBtn/blStopBtn ซ่อนอยู่ใน panel — ไม่ได้ใช้แล้ว (goLiveBtn หลักจัดการ) */
+.bl-btn-go { display:none !important; }
+.bl-btn-stop { display:none !important; }
+.bl-log { font-size:11px; color:#888; margin-top:4px; height:28px; overflow:hidden; }
 .bl-progress-step { font-size:10px; color:#ff2d55; font-weight:700; }
-#browserLiveToggle {
-  position:fixed; bottom:16px; right:16px; z-index:10000;
-  background:#ff2d55; color:#fff; border:none; border-radius:50%;
-  width:52px; height:52px; font-size:22px; cursor:pointer;
-  box-shadow:0 4px 16px rgba(255,45,85,.5);
-  display:flex; align-items:center; justify-content:center;
-}
 </style>
 
-<button id="browserLiveToggle" onclick="toggleBrowserPanel()" title="ไลฟ์จาก Browser">📡</button>
+<!-- FAB ซ่อน — one-click ผ่านปุ่ม goLiveBtn ในหน้าหลักแทน -->
+<button id="browserLiveToggle" onclick="toggleBrowserPanel()" title="ไลฟ์จาก Browser" style="display:none">📡</button>
 
 <div id="browserLivePanel">
   <div class="bl-row">
@@ -1257,21 +1256,20 @@ initShopAdmin();
     <div class="bl-status">
       <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:4px;">
         <span class="bl-status-dot" id="blDot"></span>
-        <span id="blStatusText">พร้อมไลฟ์</span>
+        <span id="blStatusText">กำลังเริ่ม...</span>
       </div>
-      <div style="font-size:11px;color:#555;margin-top:4px;">
-        เปลี่ยนแหล่งภาพ:
-        <button class="bl-btn bl-btn-cam" onclick="blStartCam()" style="padding:4px 10px;font-size:11px;">📷</button>
-        <button class="bl-btn bl-btn-screen" onclick="blStartScreen()" style="padding:4px 10px;font-size:11px;">🖥</button>
+      <div style="font-size:11px;color:#555;margin-top:3px;">
+        แหล่งภาพ:
+        <button class="bl-btn bl-btn-cam" onclick="blStartCam()" style="padding:3px 8px;font-size:11px;">📷 กล้อง</button>
+        <button class="bl-btn bl-btn-screen" onclick="blStartScreen()" style="padding:3px 8px;font-size:11px;">🖥 หน้าจอ</button>
       </div>
     </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-      <button class="bl-btn bl-btn-go" id="blGoBtn" onclick="blGoLive()">🔴 เริ่มไลฟ์</button>
-      <button class="bl-btn bl-btn-stop" id="blStopBtn" onclick="blStopLive()">■ หยุด</button>
-    </div>
+    <!-- blGoBtn/blStopBtn ยังต้องอยู่ใน DOM (JS อ้างถึง) แต่ซ่อนด้วย CSS -->
+    <button class="bl-btn bl-btn-go" id="blGoBtn" onclick="blGoLive()">เริ่มไลฟ์</button>
+    <button class="bl-btn bl-btn-stop" id="blStopBtn" onclick="blStopLive()">หยุด</button>
   </div>
-  <div class="bl-log" id="blLog">กด "เริ่มไลฟ์" — กล้องจะเปิดอัตโนมัติ</div>
-  <!-- Progress bar: แสดงระหว่างรอ GitHub Actions ~2-3 นาที -->
+  <div class="bl-log" id="blLog">กำลังเตรียมกล้อง...</div>
+  <!-- Progress bar: แสดงระหว่างรอ GitHub Actions -->
   <div id="blProgressWrap" style="display:none;margin-top:6px;">
     <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:3px;">
       <span id="blProgressLabel">รอ server...</span>
@@ -1628,21 +1626,27 @@ async function blActivateFirebase() {
       isStreaming     = true;
       streamStartTime = Date.now();
       if (!streamTimer) streamTimer = setInterval(updateDuration, 1000);
-      document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
-      document.getElementById('goLiveBtn').classList.add('streaming');
+      const mainBtn = document.getElementById('goLiveBtn');
+      if (mainBtn) { mainBtn.textContent = '⏸ Pause Stream'; mainBtn.disabled = false; mainBtn.classList.add('streaming'); }
     }
   } catch (e) {
     blLog('Firebase error: ' + e.message);
   }
 }
 
-// ── ONE-BUTTON LIVE ────────────────────────────────────────
+// ── ONE-CLICK LIVE ─────────────────────────────────────────
+// เรียกจาก goLiveBtn (ปุ่มหลัก) โดยตรง — ไม่ต้องกดใน panel อีก
 async function blGoLive() {
   // guard: ป้องกัน double-trigger ถ้ากด Live ซ้ำก่อน server พร้อม
   if (blIsTriggering) {
     blLog('⏳ กำลังรอ server อยู่ — กรุณารอสักครู่...');
     return;
   }
+
+  // แสดง status bar panel ทันที (ไม่รอให้กด FAB)
+  const panel = document.getElementById('browserLivePanel');
+  if (panel) panel.classList.add('visible');
+
   if (!blStream) {
     blSetStatus('กำลังขอสิทธิ์กล้อง...', '');
     blLog('กำลังเปิดกล้อง...');
@@ -1651,19 +1655,29 @@ async function blGoLive() {
       document.getElementById('blPreview').srcObject = blStream;
       blSetStatus('กล้องพร้อม', 'ready');
     } catch (e) {
-      blLog('ไม่สามารถเปิดกล้องได้: ' + e.message + ' — ลองกด "กล้อง" หรือ "หน้าจอ" ก่อน');
+      blLog('ไม่สามารถเปิดกล้องได้: ' + e.message);
       blSetStatus('ไม่สามารถเปิดกล้อง', '');
+      // ซ่อน panel กลับถ้ากล้องเปิดไม่ได้
+      if (panel) panel.classList.remove('visible');
       return;
     }
   }
 
-  document.getElementById('blGoBtn').style.display  = 'none';
-  document.getElementById('blStopBtn').style.display = 'inline-flex';
+  // อัปเดตปุ่ม goLiveBtn หลัก (ไม่ใช่ blGoBtn ใน panel)
+  const mainBtn = document.getElementById('goLiveBtn');
+  if (mainBtn) { mainBtn.textContent = '⏳ กำลังเริ่ม...'; mainBtn.disabled = true; }
+
   blSetStatus('กำลังเริ่ม server...', 'live');
 
   blIsTriggering = true;
   const triggered = await blTriggerGitHubActions();
-  if (!triggered) { blIsTriggering = false; blResetUI(); return; }
+  if (!triggered) {
+    blIsTriggering = false;
+    blResetUI();
+    if (panel) panel.classList.remove('visible');
+    if (mainBtn) { mainBtn.textContent = '🔴 เริ่ม Live'; mainBtn.disabled = false; }
+    return;
+  }
 
   blPollForUrls();
 }
@@ -1709,9 +1723,12 @@ function blStopLive() {
 }
 
 function blResetUI() {
-  document.getElementById('blGoBtn').disabled      = false;
-  document.getElementById('blGoBtn').style.display  = 'inline-flex';
-  document.getElementById('blStopBtn').style.display = 'none';
+  // reset ปุ่มหลัก goLiveBtn (one-click entry point)
+  const mainBtn = document.getElementById('goLiveBtn');
+  if (mainBtn) { mainBtn.textContent = '🔴 เริ่ม Live'; mainBtn.disabled = false; mainBtn.classList.remove('streaming'); }
+  // ซ่อน status panel เมื่อ reset
+  const panel = document.getElementById('browserLivePanel');
+  if (panel) panel.classList.remove('visible');
   blSetStatus('พร้อมไลฟ์', '');
   // reset progress bar
   const pWrap = document.getElementById('blProgressWrap');
