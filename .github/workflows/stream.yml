@@ -19,20 +19,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd socat
+          sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd curl
+          node --version || sudo apt-get install -y nodejs
+          echo "deps OK"
 
       # ─────────────────────────────────────────────────────────────
       # STEP 2: Write Nginx config
       #
-      # สำคัญ: เปลี่ยนจาก WebSocket → HTTP POST /ingest
-      # ปัญหาเดิม: cloudflared trycloudflare ไม่รองรับ WebSocket
-      #   "WebSocket is closed before the connection is established"
-      # แก้: Admin ส่ง video chunks ผ่าน HTTP POST /ingest (plain HTTP)
-      #   → ทำงานได้กับทุก HTTP tunnel รวมถึง cloudflared trycloudflare
-      #
       # Port 8080 จัดการ 2 อย่าง:
-      #   /hls/   → serve HLS files (GET)
-      #   /ingest → รับ video data (POST) → named pipe → ffmpeg
+      #   /hls/    → serve HLS files (GET)
+      #   /ingest  → รับ POST chunks → Node.js ingest server port 9002
+      #   /health  → health check endpoint
       # ─────────────────────────────────────────────────────────────
       - name: Write Nginx config
         run: |
@@ -76,9 +73,7 @@ jobs:
             '    }' \
             '' \
             '    # ── Video ingest (admin POST) ──────────────────────' \
-            '    # Admin ส่ง Blob chunks ผ่าน HTTP POST /ingest' \
-            '    # Nginx proxy_pass ไปยัง socat port 9002' \
-            '    # socat pipe ไปยัง ffmpeg stdin' \
+            '    # Node.js ingest server รับ chunks → ffmpeg stdin (1 process)' \
             '    location /ingest {' \
             '      proxy_pass         http://127.0.0.1:9002;' \
             '      proxy_http_version 1.1;' \
@@ -91,6 +86,12 @@ jobs:
             '      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
             '      if ($request_method = OPTIONS) { return 204; }' \
+            '    }' \
+            '' \
+            '    # ── Health check ───────────────────────────────────' \
+            '    location /health {' \
+            '      add_header Access-Control-Allow-Origin "*" always;' \
+            '      return 200 "OK\n";' \
             '    }' \
             '' \
             '    location / {' \
@@ -118,47 +119,147 @@ jobs:
           nc -z 127.0.0.1 8080 && echo "Port 8080: READY" || echo "Port 8080: NOT READY"
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 4: Start ffmpeg ingestion pipeline
+      # STEP 4: Start ffmpeg + Node.js ingest server
       #
-      # Pipeline:
-      #   Admin browser → POST /ingest (HTTP)
-      #   → Nginx proxy → port 9002 (socat)
-      #   → socat TCP-LISTEN:9002 → named pipe /tmp/video_pipe
-      #   → ffmpeg รับจาก /tmp/video_pipe → H.264/AAC → RTMP
-      #   → Nginx RTMP → HLS files /tmp/hls/stream_tcc.m3u8
+      # แก้ปัญหา Critical #1: socat + named pipe ทำให้ ffmpeg ได้ stream ขาดๆ
+      # เพราะแต่ละ POST = TCP connection ใหม่ → socat fork เขียน pipe ซ้อนกัน
       #
-      # ทำไมใช้ socat + named pipe แทน websocat:
-      #   - HTTP POST ไม่ต้องการ WebSocket protocol
-      #   - socat รับ TCP connection → เขียนลง pipe โดยตรง
-      #   - ทุก POST request = chunk ใหม่ที่ต่อเนื่องกัน
+      # วิธีใหม่: Node.js HTTP ingest server (1 process ตลอด)
+      #   - รับ POST /ingest → drain request body ต่อเนื่องไปยัง ffmpeg stdin
+      #   - ffmpeg stdin = 1 process, 1 stream → ไม่ขาด
+      #   - แต่ละ POST chunk ถูก pipe เข้า ffmpeg.stdin โดยตรง (no fork, no race)
+      #
+      # Pipeline ใหม่:
+      #   Browser POST chunks → Nginx → Node.js :9002
+      #   → ffmpeg.stdin (process pipe, 1 connection) → RTMP → HLS
       # ─────────────────────────────────────────────────────────────
-      - name: Start ffmpeg pipeline
+      - name: Start ffmpeg and Node.js ingest server
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # สร้าง named pipe สำหรับส่ง data ระหว่าง socat → ffmpeg
-          mkfifo /tmp/video_pipe
+          # ── เขียน Node.js ingest server ──────────────────────────
+          cat > /tmp/ingest_server.js << 'NODE_EOF'
+          const http = require('http');
+          const { spawn } = require('child_process');
 
-          # ffmpeg อ่านจาก named pipe → RTMP (background)
-          ffmpeg -hide_banner -loglevel warning \
-            -f webm -i /tmp/video_pipe \
-            -c:v libx264 -preset ultrafast -tune zerolatency \
-            -x264-params keyint=60:min-keyint=60:scenecut=0 \
-            -c:a aac -ar 44100 -b:a 128k \
-            -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
-            > /tmp/ffmpeg.log 2>&1 &
-          FFMPEG_PID=$!
-          echo "ffmpeg PID=$FFMPEG_PID"
+          const STREAM_KEY = process.env.STREAM_KEY || 'stream_tcc';
+          const PORT = 9002;
 
-          # socat รับ TCP port 9002 → เขียนลง named pipe
-          # fork: รับ connection ใหม่ได้เรื่อยๆ (ทุก POST request)
-          socat TCP-LISTEN:9002,fork,reuseaddr - > /tmp/video_pipe &
-          SOCAT_PID=$!
-          echo "socat PID=$SOCAT_PID"
+          // ── เริ่ม ffmpeg process ─────────────────────────────────
+          // stdin = readable stream จาก ingest server (continuous)
+          // ไม่ใช้ named pipe → ไม่มี race condition จาก multi-POST
+          const ffmpeg = spawn('ffmpeg', [
+            '-hide_banner', '-loglevel', 'warning',
+            '-f', 'webm',
+            '-i', 'pipe:0',                    // stdin ← Node.js pipe
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
+            '-c:a', 'aac',
+            '-ar', '44100',
+            '-b:a', '128k',
+            '-f', 'flv',
+            `rtmp://127.0.0.1/live/${STREAM_KEY}`
+          ], {
+            stdio: ['pipe', 'pipe', 'pipe']
+          });
 
-          # รอ port 9002 พร้อม (max 15s)
-          echo "Waiting for port 9002..."
-          for i in $(seq 1 15); do
+          ffmpeg.stdout.on('data', d => process.stdout.write('[ffmpeg] ' + d));
+          ffmpeg.stderr.on('data', d => process.stderr.write('[ffmpeg] ' + d));
+          ffmpeg.on('close', code => {
+            console.log(`[ffmpeg] exited code=${code}`);
+            // ffmpeg ตาย → ออก process ให้ watchdog restart
+            process.exit(1);
+          });
+
+          ffmpeg.on('error', err => {
+            console.error('[ffmpeg] spawn error:', err.message);
+            process.exit(1);
+          });
+
+          // ── Chunk queue + serial writer ──────────────────────────
+          // แก้ปัญหา: หลาย POST มาพร้อมกัน → เขียน stdin พร้อมกัน backpressure crash
+          // วิธีแก้: queue chunks, drain หนึ่ง chunk ต่อครั้ง
+          let writing = false;
+          const queue = [];
+
+          function drainQueue() {
+            if (writing || queue.length === 0) return;
+            writing = true;
+            const chunk = queue.shift();
+            const ok = ffmpeg.stdin.write(chunk, () => {
+              writing = false;
+              drainQueue();
+            });
+            // ถ้า backpressure → รอ drain event
+            if (!ok) {
+              ffmpeg.stdin.once('drain', () => {
+                writing = false;
+                drainQueue();
+              });
+            }
+          }
+
+          // ── HTTP ingest server ───────────────────────────────────
+          const server = http.createServer((req, res) => {
+            // CORS preflight
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', '*');
+
+            if (req.method === 'OPTIONS') {
+              res.writeHead(204); res.end(); return;
+            }
+
+            if (req.method !== 'POST') {
+              res.writeHead(405); res.end('Method Not Allowed'); return;
+            }
+
+            // รับ chunk จาก body → เพิ่มเข้า queue → drain ไป ffmpeg stdin
+            const chunks = [];
+            req.on('data', d => chunks.push(d));
+            req.on('end', () => {
+              const body = Buffer.concat(chunks);
+              if (body.length > 0) {
+                queue.push(body);
+                drainQueue();
+              }
+              // ตอบ 200 ทันทีหลัง enqueue (ไม่รอ ffmpeg write)
+              res.writeHead(200); res.end('ok');
+            });
+            req.on('error', err => {
+              console.error('[ingest] req error:', err.message);
+              res.writeHead(500); res.end();
+            });
+          });
+
+          server.listen(PORT, '127.0.0.1', () => {
+            console.log(`[ingest] server listening on port ${PORT}`);
+            console.log(`[ingest] ffmpeg PID=${ffmpeg.pid}`);
+          });
+
+          server.on('error', err => {
+            console.error('[ingest] server error:', err.message);
+            process.exit(1);
+          });
+
+          // graceful shutdown
+          process.on('SIGTERM', () => {
+            console.log('[ingest] SIGTERM → closing');
+            ffmpeg.stdin.end();
+            server.close();
+          });
+          NODE_EOF
+
+          # รัน Node.js ingest server (background)
+          STREAM_KEY="${STREAM_KEY}" node /tmp/ingest_server.js > /tmp/ingest.log 2>&1 &
+          INGEST_PID=$!
+          echo "ingest_server PID=$INGEST_PID"
+
+          # รอ port 9002 พร้อม (max 20s)
+          echo "Waiting for port 9002 (Node.js ingest server)..."
+          for i in $(seq 1 20); do
             if nc -z 127.0.0.1 9002 2>/dev/null; then
               echo "Port 9002 READY after ${i}s"
               break
@@ -166,8 +267,12 @@ jobs:
             sleep 1
           done
 
-          nc -z 127.0.0.1 9002 || { echo "ERROR: port 9002 not ready"; exit 1; }
-          echo "ffmpeg pipeline ready"
+          nc -z 127.0.0.1 9002 || {
+            echo "ERROR: port 9002 not ready — ingest.log:"
+            cat /tmp/ingest.log || true
+            exit 1
+          }
+          echo "ffmpeg + ingest server pipeline ready"
 
       # ─────────────────────────────────────────────────────────────
       # STEP 5: Install Cloudflare Tunnel
@@ -180,17 +285,14 @@ jobs:
           ./cloudflared --version
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 6: Start tunnel and POST URLs to Worker
-      #
-      # URL ที่ส่งไปยัง Worker KV:
-      #   hls_url: https://xxx.trycloudflare.com/hls/stream_tcc.m3u8
-      #   ws_url:  https://xxx.trycloudflare.com/ingest  ← HTTP POST endpoint
-      #            (ใช้ field ws_url เดิม เพื่อให้ Worker ไม่ต้องแก้)
+      # STEP 6: Start tunnel → POST URLs to Worker → notify Firebase
       # ─────────────────────────────────────────────────────────────
       - name: Start tunnel and POST URLs to Worker
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
@@ -230,35 +332,50 @@ jobs:
           fi
 
           HLS_URL="${CF_URL}/hls/${STREAM_KEY}.m3u8"
-          # ส่ง HTTP ingest URL ใน field ws_url (Worker ไม่ต้องแก้)
           INGEST_URL="${CF_URL}/ingest"
 
           echo "HLS_URL    = $HLS_URL"
           echo "INGEST_URL = $INGEST_URL"
 
-          # ตรวจ service health
+          # ── Service health check ────────────────────────────────
           echo "=== Service health ==="
           nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx):  OK" || echo "Port 8080: DOWN ⚠️"
-          nc -z 127.0.0.1 9002 && echo "Port 9002 (socat):  OK" || echo "Port 9002: DOWN ⚠️"
+          nc -z 127.0.0.1 9002 && echo "Port 9002 (ingest): OK" || echo "Port 9002: DOWN ⚠️"
           nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):   OK" || echo "Port 1935: DOWN ⚠️"
 
-          # POST URLs → Worker KV
-          # ส่ง ingest_url ใน field ws_url (admin.html อ่าน data.ws_url → blIngestUrl)
+          # ── POST URLs → Worker KV ───────────────────────────────
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: ${ADMIN_SECRET}" \
             -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${INGEST_URL}\"}")
 
-          echo "Worker HTTP: $HTTP_STATUS"
+          echo "Worker /hls-url HTTP: $HTTP_STATUS"
           cat /tmp/worker_res.txt
           echo ""
 
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "SUCCESS: URLs saved to Worker KV"
-          else
+          if [ "$HTTP_STATUS" != "200" ]; then
             echo "FAIL: Worker returned $HTTP_STATUS"
             exit 1
+          fi
+
+          echo "SUCCESS: URLs saved to Worker KV"
+
+          # ── แจ้ง Firebase ผ่าน Worker /firebase-update ──────────
+          # ทำให้ Admin/Viewer รู้ว่า server พร้อมแล้วโดยไม่ต้องรอ poll
+          # Firebase update ทำผ่าน Worker (Worker ถือ Firebase secret)
+          if [ -n "$WORKER_URL" ]; then
+            FB_STATUS=$(curl -s -o /tmp/fb_res.txt -w "%{http_code}" \
+              -X POST "${WORKER_URL}/firebase-update" \
+              -H "Content-Type: application/json" \
+              -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+              -d "{\"hls_url\": \"${HLS_URL}\", \"ingest_url\": \"${INGEST_URL}\", \"stream_key\": \"${STREAM_KEY}\"}" \
+              --max-time 10) || FB_STATUS="timeout"
+
+            echo "Worker /firebase-update HTTP: $FB_STATUS"
+            cat /tmp/fb_res.txt 2>/dev/null || true
+            echo ""
+            # ไม่ exit ถ้า firebase-update fail — KV ยังพอใช้ได้
           fi
 
       # ─────────────────────────────────────────────────────────────
@@ -273,15 +390,18 @@ jobs:
             sleep 30
 
             if [ $((i % 20)) -eq 0 ]; then
-              echo "=== $((i/2)) min elapsed ==="
-              tail -5 /tmp/ffmpeg.log 2>/dev/null || true
+              MINS=$((i / 2))
+              echo "=== ${MINS} min elapsed ==="
+              tail -5 /tmp/ingest.log 2>/dev/null || true
 
-              # watchdog: restart socat ถ้า port 9002 down
+              # watchdog: restart Node.js ingest server ถ้า port 9002 down
               if ! nc -z 127.0.0.1 9002 2>/dev/null; then
-                echo "⚠️ port 9002 down — restarting socat..."
-                socat TCP-LISTEN:9002,fork,reuseaddr - > /tmp/video_pipe &
-                sleep 2
-                nc -z 127.0.0.1 9002 && echo "✅ port 9002 recovered" || echo "❌ still down"
+                echo "⚠️ port 9002 down — restarting ingest server..."
+                STREAM_KEY="${STREAM_KEY}" node /tmp/ingest_server.js >> /tmp/ingest.log 2>&1 &
+                sleep 3
+                nc -z 127.0.0.1 9002 \
+                  && echo "✅ port 9002 recovered" \
+                  || echo "❌ port 9002 still down"
               fi
 
               # watchdog: restart nginx ถ้า port 8080 down
@@ -289,7 +409,9 @@ jobs:
                 echo "⚠️ port 8080 down — restarting nginx..."
                 sudo nginx
                 sleep 2
-                nc -z 127.0.0.1 8080 && echo "✅ port 8080 recovered" || echo "❌ still down"
+                nc -z 127.0.0.1 8080 \
+                  && echo "✅ port 8080 recovered" \
+                  || echo "❌ port 8080 still down"
               fi
             fi
           done
