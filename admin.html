@@ -1261,19 +1261,24 @@ initShopAdmin();
 </div>
 
 <script>
-// ─── Browser Live Module (v3) ──────────────────────────────
-// ONE-BUTTON LIVE: กดปุ่มเดียว → กล้องเปิดอัตโนมัติ → trigger server
-// → poll WS URL → MediaRecorder → WebSocket → ffmpeg → Nginx → HLS
-// → Firebase → Viewer เห็นภาพ  (ไม่ต้องกรอกอะไรเพิ่มเลย)
+// ─── Browser Live Module (v4 — HTTP POST Chunked) ─────────
+// ปัญหา: cloudflared trycloudflare ไม่รองรับ WebSocket protocol
+// (error: "WebSocket is closed before the connection is established")
+// แก้: เปลี่ยนเป็น HTTP POST ส่ง video chunks ทีละก้อน
+// → ไม่ต้องการ WebSocket เลย → ทำงานได้กับทุก HTTP tunnel
+//
+// Flow:
+//   MediaRecorder → ondataavailable (ทุก 500ms) → Blob chunk
+//   → fetch POST /ingest (HTTP) → Nginx → ffmpeg stdin → RTMP → HLS
 // ──────────────────────────────────────────────────────────
 
 let blStream    = null;   // MediaStream (กล้อง/หน้าจอ)
 let blRecorder  = null;   // MediaRecorder
-let blWs        = null;   // WebSocket ไปยัง ffmpeg
 let blPolling   = null;   // interval สำหรับ poll Worker
 let blHlsUrl    = null;
-let blWsUrl     = null;
+let blIngestUrl = null;   // HTTP POST URL สำหรับส่ง video chunks (ไม่ใช่ WS แล้ว)
 let blMode      = 'cam';  // 'cam' | 'screen'
+let blSending   = false;  // ป้องกัน chunk queue ล้น
 
 // ── helpers ────────────────────────────────────────────────
 function toggleBrowserPanel() {
@@ -1325,8 +1330,6 @@ async function blTriggerGitHubActions() {
     return false;
   }
 
-  // ── Step 0: clear URL เก่าออกจาก KV ก่อน trigger ──────
-  // ป้องกัน Admin/Viewer เห็น tunnel URL รอบก่อนที่หมดอายุแล้ว
   blLog('กำลังล้าง URL เก่า...');
   try {
     await fetch(proxyUrl + '/clear-url', {
@@ -1334,20 +1337,14 @@ async function blTriggerGitHubActions() {
       headers: { 'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '' },
     });
     addLog('🧹 ล้าง KV URL เก่าแล้ว');
-  } catch (_) {
-    // Worker อาจยังไม่มี /clear-url → ไม่ block การ trigger
-    addLog('⚠️ /clear-url ไม่ตอบ — ข้ามไป');
-  }
+  } catch (_) { addLog('⚠️ /clear-url ไม่ตอบ — ข้ามไป'); }
 
   blLog('กำลัง trigger GitHub Actions...');
 
   const doTrigger = async () => {
     const res = await fetch(proxyUrl + '/trigger', {
       method: 'POST',
-      headers: {
-        'Content-Type':   'application/json',
-        'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '',
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': ADMIN_CONFIG.adminSecret || '' },
       body: JSON.stringify({ stream_key: ADMIN_CONFIG.streamKeyReal || 'stream_tcc' }),
     });
     let data = {};
@@ -1357,45 +1354,37 @@ async function blTriggerGitHubActions() {
 
   try {
     let { res, data } = await doTrigger();
-
-    // 502 = GitHub 422 (workflow already running) → รอแล้ว retry
     if (res.status === 502 && !data.ok) {
-      blLog('Worker ตอบ 502 — retry ใน 3 วินาที...');
+      blLog('Worker ตอบ 502 — retry ใน 3s...');
       await new Promise(r => setTimeout(r, 3000));
       ({ res, data } = await doTrigger());
     }
-
-    if (res.ok && data.ok) {
-      blLog('✅ GitHub Actions รันแล้ว! กำลังรอ server...');
-      return true;
-    }
-
-    const detail = data.detail ? ` (${data.detail.substring(0, 80)})` : '';
-    blLog(`❌ Worker error: ${data.error || res.status}${detail}`);
-    addLog(`Worker error detail: HTTP ${res.status} — ${JSON.stringify(data)}`);
+    if (res.ok && data.ok) { blLog('✅ GitHub Actions รันแล้ว! กำลังรอ server...'); return true; }
+    blLog(`❌ Worker error: ${data.error || res.status}`);
     return false;
-
   } catch (e) {
     blLog('❌ ไม่สามารถเชื่อมต่อ Worker: ' + e.message);
     return false;
   }
 }
 
-// ── Poll Worker → รอ WS URL + HLS URL ─────────────────────
+// ── Poll Worker → รอ ingest_url + HLS URL ─────────────────
+// Worker KV จะมี ingest_url = https://xxx.trycloudflare.com/ingest
+// (ส่งมาใน field ws_url แต่เราเปลี่ยนใช้เป็น HTTP POST endpoint)
 function blPollForUrls() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
   let tries = 0;
-  const maxTries = 96; // 96 × 5s = 8 นาที (GitHub Actions ใช้เวลา ~3-5 นาทีในการ start)
+  const maxTries = 96;
 
   blPolling = setInterval(async () => {
     tries++;
     const elapsed = tries * 5;
-    const remain = Math.ceil((maxTries - tries) * 5 / 60);
+    const remain  = Math.ceil((maxTries - tries) * 5 / 60);
     blLog(`รอ server พร้อม... (${elapsed}s ผ่านไป | เหลือ ~${remain} นาที)`);
 
     if (tries > maxTries) {
       clearInterval(blPolling); blPolling = null;
-      blLog('หมดเวลารอ server — ลองกด Live ใหม่อีกครั้ง');
+      blLog('หมดเวลารอ server — ลองกด Live ใหม่');
       blSetStatus('เกิดข้อผิดพลาด', '');
       blResetUI();
       return;
@@ -1405,48 +1394,69 @@ function blPollForUrls() {
       const res  = await fetch(proxyUrl + '/hls-url');
       const data = await res.json();
 
-      if (data.ready && data.hls_url && data.ws_url) {
+      if (data.ready && data.hls_url) {
         clearInterval(blPolling); blPolling = null;
-        blHlsUrl = data.hls_url;
-        blWsUrl  = data.ws_url;
-        blLog('Server พร้อม! กำลังเชื่อมต่อ stream...');
-        blSetStatus('กำลังเชื่อมต่อ...', 'live');
-        // เชื่อม WebSocket แล้วเริ่มส่ง video ทันที
+        blHlsUrl    = data.hls_url;
+        // ws_url field ถูกเปลี่ยนใช้เป็น HTTP ingest URL:
+        // format: https://xxx.trycloudflare.com/ingest
+        // (stream.yml เปลี่ยน WS_URL → INGEST_URL แล้ว)
+        blIngestUrl = data.ws_url || data.ingest_url || null;
+        blLog('Server พร้อม! กำลังเริ่ม stream...');
+        blSetStatus('กำลัง Live 🔴', 'live');
         blStartStreaming();
       }
-    } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
+    } catch (_) {}
   }, 5000);
 }
 
-// ── MediaRecorder → WebSocket → ffmpeg ────────────────────
-// ⚠️  สำคัญ: ต้อง restart MediaRecorder ทุกครั้งที่เปิด WebSocket ใหม่
-// เพราะ WebM EBML header ส่งแค่ตอน MediaRecorder.start() เท่านั้น
-// ffmpeg spawn ใหม่ทุก connection → ต้องการ EBML header ใหม่ทุกครั้ง
-// ถ้าไม่ restart → ffmpeg ได้รับ video data โดยไม่มี header → ไม่เขียน .m3u8
+// ── HTTP Chunked POST Streaming ────────────────────────────
+// แทน WebSocket ใช้ fetch POST ส่ง Blob chunk ทีละก้อน
+// Nginx รับ POST /ingest → pipe ไปยัง ffmpeg
+// ไม่มีปัญหา tunnel compatibility เพราะเป็น plain HTTP
 
-let blReconnectTimer = null;   // timer สำหรับ auto-reconnect
-let blReconnectCount = 0;      // นับจำนวนครั้ง reconnect
-const BL_RECONNECT_MAX = 10;   // สูงสุด 10 ครั้ง
-
-// เลือก MIME type ครั้งเดียว (reuse ระหว่าง reconnect)
+// เลือก MIME type
 const BL_MIME = (() => {
-  const types = ['video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/webm'];
+  const types = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'];
   return types.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
 })();
 
+// Queue สำหรับ chunks ที่รอส่ง
+let blChunkQueue  = [];
+let blChunkSender = null;  // interval สำหรับ drain queue
+
 function blStopRecorder() {
-  // หยุด MediaRecorder เก่าก่อน (ถ้ามี) — ไม่ throw ถ้า inactive
   if (blRecorder) {
-    try {
-      if (blRecorder.state !== 'inactive') blRecorder.stop();
-    } catch (_) {}
+    try { if (blRecorder.state !== 'inactive') blRecorder.stop(); } catch (_) {}
     blRecorder = null;
   }
 }
 
-function blStartRecorder(ws) {
-  // เริ่ม MediaRecorder ใหม่ทุกครั้งที่ WebSocket เปิดสำเร็จ
-  // → ส่ง EBML header ใหม่ ทำให้ ffmpeg decode ได้จาก frame แรก
+async function blSendChunk(blob) {
+  // ส่ง chunk เดียวผ่าน HTTP POST ไปยัง /ingest
+  // ไม่ throw — log error แล้วทำต่อ
+  if (!blIngestUrl || !isStreaming) return;
+  try {
+    const res = await fetch(blIngestUrl, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body:    blob,
+    });
+    // ถ้า server ตอบ error → log แต่ไม่หยุด
+    if (!res.ok && res.status !== 200) {
+      console.warn('[TCC] ingest HTTP', res.status);
+    }
+  } catch (e) {
+    console.warn('[TCC] ingest send error:', e.message);
+  }
+}
+
+function blStartStreaming() {
+  if (!blStream || !blIngestUrl) {
+    blLog('ไม่มี stream หรือ ingest URL');
+    return;
+  }
+
+  blLog('เริ่ม MediaRecorder → HTTP POST streaming...');
   blStopRecorder();
 
   blRecorder = new MediaRecorder(blStream, {
@@ -1456,8 +1466,9 @@ function blStartRecorder(ws) {
   });
 
   blRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(e.data);
+    if (e.data && e.data.size > 0) {
+      // ส่ง chunk ทันทีแบบ fire-and-forget (ไม่ block MediaRecorder)
+      blSendChunk(e.data);
     }
   };
 
@@ -1465,74 +1476,22 @@ function blStartRecorder(ws) {
     blLog('MediaRecorder error: ' + (e.error?.message || 'unknown'));
   };
 
+  blRecorder.onstop = () => {
+    blLog('MediaRecorder หยุดแล้ว');
+  };
+
   // timeslice 500ms — ส่ง chunk ทุก 0.5s
   blRecorder.start(500);
-  blLog('MediaRecorder เริ่มส่ง stream (MIME: ' + BL_MIME + ')');
-}
+  blLog('🔴 กำลัง Live! (HTTP POST → ffmpeg → HLS)');
+  blSetStatus('กำลัง Live 🔴', 'live');
 
-function blStartStreaming() {
-  if (!blStream || !blWsUrl) {
-    blLog('ไม่มี stream หรือ WS URL');
-    return;
-  }
-
-  // ยกเลิก reconnect timer เก่าก่อน (ถ้ามี)
-  if (blReconnectTimer) { clearTimeout(blReconnectTimer); blReconnectTimer = null; }
-
-  blLog('กำลังเชื่อมต่อ WebSocket... (ครั้งที่ ' + (blReconnectCount + 1) + ')');
-
-  // ปิด WS เก่าถ้ายังเปิดอยู่
-  if (blWs) {
-    try { blWs.onclose = null; blWs.close(); } catch (_) {}
-    blWs = null;
-  }
-
-  const ws = new WebSocket(blWsUrl);
-  ws.binaryType = 'arraybuffer';
-  blWs = ws;
-
-  ws.onopen = () => {
-    blReconnectCount = 0;  // reset counter เมื่อเชื่อมสำเร็จ
-    blLog('WebSocket เชื่อมต่อแล้ว — เริ่มส่ง stream!');
-    blSetStatus('กำลัง Live 🔴', 'live');
-
-    // ⚠️  restart MediaRecorder ทุกครั้ง เพื่อส่ง EBML header ใหม่ให้ ffmpeg ใหม่
-    blStartRecorder(ws);
-
-    // หลังส่ง stream ~10s → HLS ควรพร้อม → update Firebase
-    setTimeout(blActivateFirebase, 10000);
-  };
-
-  ws.onerror = () => {
-    blLog('WebSocket error — กำลัง reconnect...');
-  };
-
-  ws.onclose = (evt) => {
-    blStopRecorder();
-
-    // ถ้า live ยังอยู่และยังไม่เกิน max retry → reconnect อัตโนมัติ
-    if (isStreaming && blWsUrl && blReconnectCount < BL_RECONNECT_MAX) {
-      blReconnectCount++;
-      const delay = Math.min(2000 * blReconnectCount, 10000); // backoff: 2s, 4s, ... 10s
-      blLog(`WebSocket ขาดการเชื่อมต่อ (code ${evt.code}) — reconnect ใน ${delay/1000}s (ครั้งที่ ${blReconnectCount}/${BL_RECONNECT_MAX})`);
-      blSetStatus('กำลัง reconnect...', '');
-      blReconnectTimer = setTimeout(() => blStartStreaming(), delay);
-    } else if (blReconnectCount >= BL_RECONNECT_MAX) {
-      blLog('WebSocket ขาดการเชื่อมต่อ — หมด retry แล้ว กรุณากด Live ใหม่');
-      blSetStatus('ขาดการเชื่อมต่อ', '');
-    }
-    // ถ้า !isStreaming = กด Stop เอง → ไม่ reconnect
-  };
+  // หลังส่ง stream ~10s → HLS ควรพร้อม → update Firebase
+  setTimeout(blActivateFirebase, 10000);
 }
 
 // ── อัปเดต Firebase → Viewer เห็นภาพ ─────────────────────
 async function blActivateFirebase() {
-  // แก้ไข: ถ้า db เป็น null (Firebase ยังไม่ connect) ให้แสดง warning
-  // แต่ยังอัปเดต UI ฝั่ง Admin ให้รู้ว่ากำลัง Live อยู่
-  if (!blHlsUrl) {
-    blLog('ไม่มี HLS URL — ไม่สามารถอัปเดต Firebase ได้');
-    return;
-  }
+  if (!blHlsUrl) { blLog('ไม่มี HLS URL'); return; }
   try {
     const title = document.getElementById('streamTitleInput')?.value || '';
     const desc  = document.getElementById('streamDescInput')?.value  || '';
@@ -1543,33 +1502,27 @@ async function blActivateFirebase() {
       blLog('✅ สมาชิกเห็นภาพแล้ว! (Firebase + Worker KV)');
       addLog('✅ Firebase อัปเดตแล้ว — viewer เห็นภาพ');
     } else {
-      // Firebase ไม่ได้ตั้งค่า — Worker KV ยังส่ง HLS ได้อยู่
-      blLog('⚠️ Firebase offline — แต่ Viewer poll ได้จาก Worker KV');
-      addLog('⚠️ Firebase ไม่ได้ตั้งค่า — Viewer ใช้ Worker poll fallback แทน');
+      blLog('⚠️ Firebase offline — Viewer ใช้ Worker poll fallback');
+      addLog('⚠️ Firebase ไม่ได้ตั้งค่า — Viewer ใช้ Worker poll fallback');
     }
 
     blSetStatus('กำลัง Live 🔴', 'live');
-
-    // อัปเดต UI หลัก
     document.getElementById('statusDot').className   = 'status-dot live';
     document.getElementById('statusText').textContent = 'กำลัง Live';
     if (!isStreaming) {
-      isStreaming      = true;
-      streamStartTime  = Date.now();
+      isStreaming     = true;
+      streamStartTime = Date.now();
       if (!streamTimer) streamTimer = setInterval(updateDuration, 1000);
       document.getElementById('goLiveBtn').textContent = '⏸ Pause Stream';
       document.getElementById('goLiveBtn').classList.add('streaming');
     }
   } catch (e) {
-    blLog('Firebase update error: ' + e.message);
-    addLog('Firebase error: ' + e.message);
+    blLog('Firebase error: ' + e.message);
   }
 }
 
 // ── ONE-BUTTON LIVE ────────────────────────────────────────
-// กดปุ่ม "เริ่ม Live" เดียว → ทำทุกอย่างอัตโนมัติ
 async function blGoLive() {
-  // ขั้นที่ 1: เปิดกล้องอัตโนมัติถ้ายังไม่มี stream
   if (!blStream) {
     blSetStatus('กำลังขอสิทธิ์กล้อง...', '');
     blLog('กำลังเปิดกล้อง...');
@@ -1584,51 +1537,31 @@ async function blGoLive() {
     }
   }
 
-  // ขั้นที่ 2: อัปเดต UI
-  document.getElementById('blGoBtn').style.display   = 'none';
-  document.getElementById('blStopBtn').style.display  = 'inline-flex';
+  document.getElementById('blGoBtn').style.display  = 'none';
+  document.getElementById('blStopBtn').style.display = 'inline-flex';
   blSetStatus('กำลังเริ่ม server...', 'live');
 
-  // ขั้นที่ 3: trigger GitHub Actions
   const triggered = await blTriggerGitHubActions();
-  if (!triggered) {
-    blResetUI();
-    return;
-  }
+  if (!triggered) { blResetUI(); return; }
 
-  // ขั้นที่ 4: poll จนได้ WS URL + HLS URL แล้วเชื่อม stream อัตโนมัติ
   blPollForUrls();
 }
 
 // ── หยุด Live ──────────────────────────────────────────────
 function blStopLive() {
-  // ยกเลิก auto-reconnect ก่อน (ต้องทำก่อน set isStreaming=false)
-  if (blReconnectTimer) { clearTimeout(blReconnectTimer); blReconnectTimer = null; }
-  blReconnectCount = 0;
-
-  // หยุด MediaRecorder
   blStopRecorder();
-
-  // ปิด WebSocket (onclose จะไม่ reconnect เพราะ isStreaming จะ=false)
-  if (blWs) {
-    try { blWs.onclose = null; blWs.close(); } catch (_) {}
-    blWs = null;
-  }
-
-  // หยุด stream tracks
-  if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
-
-  // หยุด poll
   if (blPolling) { clearInterval(blPolling); blPolling = null; }
+  if (blChunkSender) { clearInterval(blChunkSender); blChunkSender = null; }
+  blChunkQueue = [];
 
+  if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
   document.getElementById('blPreview').srcObject = null;
-  blHlsUrl = null;
-  blWsUrl  = null;
+  blHlsUrl    = null;
+  blIngestUrl = null;
 
   blResetUI();
   blLog('หยุด Live แล้ว');
 
-  // ล้าง Firebase
   if (db) {
     db.ref('liveStats/isLive').set(false);
     db.ref('streamInfo/hlsUrl').remove();
@@ -1641,6 +1574,7 @@ function blResetUI() {
   document.getElementById('blStopBtn').style.display = 'none';
   blSetStatus('พร้อมไลฟ์', '');
 }
+
 </script>
 
 </body>
