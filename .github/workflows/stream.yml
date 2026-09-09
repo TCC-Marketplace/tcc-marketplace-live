@@ -74,18 +74,52 @@ jobs:
             '' \
             '    # ── Video ingest (admin POST) ──────────────────────' \
             '    # Node.js ingest server รับ chunks → ffmpeg stdin (1 process)' \
+            '    # Fix: proxy_intercept_errors + named location @cors_502' \
+            '    #      เพื่อ inject CORS headers แม้ตอน upstream 502' \
+            '    #      (add_header ใน proxy location ไม่ inject ตอน error response)' \
             '    location /ingest {' \
-            '      proxy_pass         http://127.0.0.1:9002;' \
-            '      proxy_http_version 1.1;' \
+            '      proxy_pass              http://127.0.0.1:9002;' \
+            '      proxy_http_version      1.1;' \
             '      proxy_request_buffering off;' \
-            '      proxy_buffering    off;' \
-            '      proxy_read_timeout 3600s;' \
-            '      proxy_send_timeout 3600s;' \
-            '      client_max_body_size 0;' \
+            '      proxy_buffering         off;' \
+            '      proxy_read_timeout      3600s;' \
+            '      proxy_send_timeout      3600s;' \
+            '      client_max_body_size    0;' \
             '      add_header Access-Control-Allow-Origin  "*" always;' \
             '      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
             '      if ($request_method = OPTIONS) { return 204; }' \
+            '      # Fix CORS on upstream error: intercept 502/503/504 → named location' \
+            '      proxy_intercept_errors  on;' \
+            '      error_page 502 503 504 = @ingest_error;' \
+            '    }' \
+            '' \
+            '    # ── CORS-safe upstream error handler ───────────────' \
+            '    location @ingest_error {' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
+            '      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Headers "*" always;' \
+            '      add_header Content-Type "application/json" always;' \
+            '      return 502 "{\"ok\":false,\"error\":\"ingest upstream unavailable\"}";' \
+            '    }' \
+            '' \
+            '    # ── Ingest pipeline status (admin poll) ────────────' \
+            '    location /ingest-status {' \
+            '      proxy_pass              http://127.0.0.1:9002/status;' \
+            '      proxy_http_version      1.1;' \
+            '      proxy_read_timeout      5s;' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
+            '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Headers "*" always;' \
+            '      if ($request_method = OPTIONS) { return 204; }' \
+            '      proxy_intercept_errors  on;' \
+            '      error_page 502 503 504 = @ingest_status_error;' \
+            '    }' \
+            '' \
+            '    location @ingest_status_error {' \
+            '      add_header Access-Control-Allow-Origin  "*" always;' \
+            '      add_header Content-Type "application/json" always;' \
+            '      return 503 "{\"ready\":false,\"error\":\"ingest server not ready\"}";' \
             '    }' \
             '' \
             '    # ── Health check ───────────────────────────────────' \
@@ -139,118 +173,143 @@ jobs:
 
           # ── เขียน Node.js ingest server ──────────────────────────
           cat > /tmp/ingest_server.js << 'NODE_EOF'
-          const http = require('http');
-          const { spawn } = require('child_process');
+const http = require('http');
+const { spawn } = require('child_process');
 
-          const STREAM_KEY = process.env.STREAM_KEY || 'stream_tcc';
-          const PORT = 9002;
+const STREAM_KEY = process.env.STREAM_KEY || 'stream_tcc';
+const PORT = 9002;
 
-          // ── เริ่ม ffmpeg process ─────────────────────────────────
-          // stdin = readable stream จาก ingest server (continuous)
-          // ไม่ใช้ named pipe → ไม่มี race condition จาก multi-POST
-          const ffmpeg = spawn('ffmpeg', [
-            '-hide_banner', '-loglevel', 'warning',
-            '-f', 'webm',
-            '-i', 'pipe:0',                    // stdin ← Node.js pipe
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
-            '-c:a', 'aac',
-            '-ar', '44100',
-            '-b:a', '128k',
-            '-f', 'flv',
-            `rtmp://127.0.0.1/live/${STREAM_KEY}`
-          ], {
-            stdio: ['pipe', 'pipe', 'pipe']
-          });
+// ── เริ่ม ffmpeg process ─────────────────────────────────
+// stdin = readable stream จาก ingest server (continuous)
+// ไม่ใช้ named pipe → ไม่มี race condition จาก multi-POST
+const ffmpeg = spawn('ffmpeg', [
+  '-hide_banner', '-loglevel', 'warning',
+  '-f', 'webm',
+  '-i', 'pipe:0',                    // stdin ← Node.js pipe
+  '-c:v', 'libx264',
+  '-preset', 'ultrafast',
+  '-tune', 'zerolatency',
+  '-x264-params', 'keyint=60:min-keyint=60:scenecut=0',
+  '-c:a', 'aac',
+  '-ar', '44100',
+  '-b:a', '128k',
+  '-f', 'flv',
+  `rtmp://127.0.0.1/live/${STREAM_KEY}`
+], {
+  stdio: ['pipe', 'pipe', 'pipe']
+});
 
-          ffmpeg.stdout.on('data', d => process.stdout.write('[ffmpeg] ' + d));
-          ffmpeg.stderr.on('data', d => process.stderr.write('[ffmpeg] ' + d));
-          ffmpeg.on('close', code => {
-            console.log(`[ffmpeg] exited code=${code}`);
-            // ffmpeg ตาย → ออก process ให้ watchdog restart
-            process.exit(1);
-          });
+ffmpeg.stdout.on('data', d => process.stdout.write('[ffmpeg] ' + d));
+ffmpeg.stderr.on('data', d => process.stderr.write('[ffmpeg] ' + d));
+ffmpeg.on('close', code => {
+  console.log(`[ffmpeg] exited code=${code}`);
+  // ffmpeg ตาย → ออก process ให้ watchdog restart
+  process.exit(1);
+});
 
-          ffmpeg.on('error', err => {
-            console.error('[ffmpeg] spawn error:', err.message);
-            process.exit(1);
-          });
+ffmpeg.on('error', err => {
+  console.error('[ffmpeg] spawn error:', err.message);
+  process.exit(1);
+});
 
-          // ── Chunk queue + serial writer ──────────────────────────
-          // แก้ปัญหา: หลาย POST มาพร้อมกัน → เขียน stdin พร้อมกัน backpressure crash
-          // วิธีแก้: queue chunks, drain หนึ่ง chunk ต่อครั้ง
-          let writing = false;
-          const queue = [];
+// ── Chunk queue + serial writer ──────────────────────────
+// แก้ปัญหา: หลาย POST มาพร้อมกัน → เขียน stdin พร้อมกัน backpressure crash
+// วิธีแก้: queue chunks, drain หนึ่ง chunk ต่อครั้ง
+let writing = false;
+const queue = [];
 
-          function drainQueue() {
-            if (writing || queue.length === 0) return;
-            writing = true;
-            const chunk = queue.shift();
-            const ok = ffmpeg.stdin.write(chunk, () => {
-              writing = false;
-              drainQueue();
-            });
-            // ถ้า backpressure → รอ drain event
-            if (!ok) {
-              ffmpeg.stdin.once('drain', () => {
-                writing = false;
-                drainQueue();
-              });
-            }
-          }
+function drainQueue() {
+  if (writing || queue.length === 0) return;
+  writing = true;
+  const chunk = queue.shift();
+  const ok = ffmpeg.stdin.write(chunk, () => {
+    writing = false;
+    drainQueue();
+  });
+  // ถ้า backpressure → รอ drain event
+  if (!ok) {
+    ffmpeg.stdin.once('drain', () => {
+      writing = false;
+      drainQueue();
+    });
+  }
+}
 
-          // ── HTTP ingest server ───────────────────────────────────
-          const server = http.createServer((req, res) => {
-            // CORS preflight
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', '*');
+// ── Stats counters ───────────────────────────────────────
+let chunksReceived = 0;
+let bytesReceived  = 0;
+const startedAt    = Date.now();
 
-            if (req.method === 'OPTIONS') {
-              res.writeHead(204); res.end(); return;
-            }
+// ── HTTP ingest server ───────────────────────────────────
+const server = http.createServer((req, res) => {
+  // CORS headers — ทุก request รวมถึง error response
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
 
-            if (req.method !== 'POST') {
-              res.writeHead(405); res.end('Method Not Allowed'); return;
-            }
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204); res.end(); return;
+  }
 
-            // รับ chunk จาก body → เพิ่มเข้า queue → drain ไป ffmpeg stdin
-            const chunks = [];
-            req.on('data', d => chunks.push(d));
-            req.on('end', () => {
-              const body = Buffer.concat(chunks);
-              if (body.length > 0) {
-                queue.push(body);
-                drainQueue();
-              }
-              // ตอบ 200 ทันทีหลัง enqueue (ไม่รอ ffmpeg write)
-              res.writeHead(200); res.end('ok');
-            });
-            req.on('error', err => {
-              console.error('[ingest] req error:', err.message);
-              res.writeHead(500); res.end();
-            });
-          });
+  // ── GET /status — ingest pipeline health check ─────────
+  // ใช้โดย Nginx /ingest-status → admin.html poll ก่อนส่ง chunk
+  if (req.method === 'GET' && req.url === '/status') {
+    const uptime = Math.floor((Date.now() - startedAt) / 1000);
+    const ffmpegAlive = ffmpeg && !ffmpeg.killed && ffmpeg.exitCode === null;
+    res.writeHead(ffmpegAlive ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ready:          ffmpegAlive,
+      ffmpeg_pid:     ffmpeg ? ffmpeg.pid : null,
+      ffmpeg_alive:   ffmpegAlive,
+      queue_length:   queue.length,
+      chunks_received: chunksReceived,
+      bytes_received:  bytesReceived,
+      uptime_seconds:  uptime,
+    }));
+    return;
+  }
 
-          server.listen(PORT, '127.0.0.1', () => {
-            console.log(`[ingest] server listening on port ${PORT}`);
-            console.log(`[ingest] ffmpeg PID=${ffmpeg.pid}`);
-          });
+  if (req.method !== 'POST') {
+    res.writeHead(405); res.end('Method Not Allowed'); return;
+  }
 
-          server.on('error', err => {
-            console.error('[ingest] server error:', err.message);
-            process.exit(1);
-          });
+  // ── POST /ingest — รับ chunk → queue → ffmpeg stdin ────
+  const chunks = [];
+  req.on('data', d => chunks.push(d));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks);
+    if (body.length > 0) {
+      chunksReceived++;
+      bytesReceived += body.length;
+      queue.push(body);
+      drainQueue();
+    }
+    // ตอบ 200 ทันทีหลัง enqueue (ไม่รอ ffmpeg write)
+    res.writeHead(200); res.end('ok');
+  });
+  req.on('error', err => {
+    console.error('[ingest] req error:', err.message);
+    res.writeHead(500); res.end();
+  });
+});
 
-          // graceful shutdown
-          process.on('SIGTERM', () => {
-            console.log('[ingest] SIGTERM → closing');
-            ffmpeg.stdin.end();
-            server.close();
-          });
-          NODE_EOF
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`[ingest] server listening on port ${PORT}`);
+  console.log(`[ingest] ffmpeg PID=${ffmpeg.pid}`);
+});
+
+server.on('error', err => {
+  console.error('[ingest] server error:', err.message);
+  process.exit(1);
+});
+
+// graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('[ingest] SIGTERM → closing');
+  ffmpeg.stdin.end();
+  server.close();
+});
+NODE_EOF
 
           # รัน Node.js ingest server (background)
           STREAM_KEY="${STREAM_KEY}" node /tmp/ingest_server.js > /tmp/ingest.log 2>&1 &
