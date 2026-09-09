@@ -754,6 +754,7 @@
 // ─────────────────────────────────────────
 const CONFIG = {
   hlsUrl: '',            // ใส่ .m3u8 URL เช่น http://YOUR_SERVER/live/stream.m3u8
+  workerUrl: 'https://tcc-marketplace-live.tcc-team-developer.workers.dev',
   streamTitle: '📊 วิเคราะห์ตลาดคริปโต Live – TCC Marketplace',
   streamSub: 'เริ่ม 14:00 น. | BTC ETH BNB วิเคราะห์เทคนิค',
   shareUrl: window.location.href,
@@ -789,7 +790,7 @@ let hlsInstance = null; // track HLS instance for clean re-init
 // WORKER POLL FALLBACK
 // ถ้า Firebase ไม่ส่ง hlsUrl มา → poll Worker โดยตรง
 // ─────────────────────────────────────────
-const WORKER_URL = 'https://tcc-marketplace-live.tcc-team-developer.workers.dev';
+const WORKER_URL = CONFIG.workerUrl;
 let workerPollInterval = null;
 
 function startWorkerPoll() {
