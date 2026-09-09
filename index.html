@@ -477,9 +477,12 @@
   <!-- offline -->
   <div class="offline-screen" id="offlineScreen">
     <div class="off-icon">📡</div>
-    <div class="waiting">รอเริ่ม Live...</div>
-    <p>ช่อง TCC Marketplace จะเริ่ม Live เร็วๆ นี้</p>
+    <div class="waiting" id="offlineTitle">รอเริ่ม Live...</div>
+    <p id="offlineDesc">ช่อง TCC Marketplace จะเริ่ม Live เร็วๆ นี้</p>
     <p style="font-size:11px;color:var(--muted);margin-top:8px;">กด Follow เพื่อรับการแจ้งเตือน</p>
+    <p id="offlineRetryHint" style="font-size:11px;color:var(--muted);margin-top:4px;display:none;">
+      🔄 กำลังรอ stream กลับมาอัตโนมัติ...
+    </p>
   </div>
 </div>
 
@@ -788,54 +791,40 @@ let hlsInstance = null; // track HLS instance for clean re-init
 // ─────────────────────────────────────────
 const WORKER_URL = 'https://tcc-marketplace-live.tcc-team-developer.workers.dev';
 let workerPollInterval = null;
-let hlsRetryCount = 0;         // นับจำนวนครั้งที่ HLS.js fatal → ต้อง restart poll
-const HLS_RETRY_MAX = 20;      // retry HLS สูงสุด 20 ครั้ง × 5s = 100s
 
 function startWorkerPoll() {
   if (workerPollInterval) return; // ไม่ poll ซ้ำ
   console.log('[TCC] Worker poll started...');
+  let pollTries = 0;
+  const MAX_POLL_TRIES = 120; // 120 × 5s = 10 นาที
+
   workerPollInterval = setInterval(async () => {
+    pollTries++;
+    // timeout: ถ้า poll เกิน 10 นาทียังไม่ได้ → หยุด (ประหยัด request)
+    if (pollTries > MAX_POLL_TRIES) {
+      clearInterval(workerPollInterval);
+      workerPollInterval = null;
+      console.log('[TCC] Worker poll timeout after 10 min');
+      return;
+    }
     try {
       const res  = await fetch(WORKER_URL + '/hls-url', { cache: 'no-store' });
       const data = await res.json();
       if (data.ready && data.hls_url) {
-        // ได้ URL มาแล้ว — แต่ยังไม่ clear interval ทันที
-        // รอให้ HLS.js ยืนยันว่าเล่นได้จริงก่อน (MANIFEST_PARSED)
-        // ถ้ายัง 404 อยู่ interval จะทำงานต่อ → retry initPlayer อีก 5s
-        if (CONFIG.hlsUrl !== data.hls_url) {
-          CONFIG.hlsUrl = data.hls_url;
-          console.log('[TCC] Worker poll: HLS URL received → initPlayer');
-        }
-        // เรียก initPlayer ทุก tick จนกว่าจะเล่นได้ (idempotent — destroy แล้ว re-init)
+        clearInterval(workerPollInterval);
+        workerPollInterval = null;
+        CONFIG.hlsUrl = data.hls_url;
+        console.log('[TCC] Worker poll: HLS ready → initPlayer');
+        // reset retry hint
+        const hint = document.getElementById('offlineRetryHint');
+        const title = document.getElementById('offlineTitle');
+        if (hint) hint.style.display = 'none';
+        if (title) title.textContent = 'รอเริ่ม Live...';
+        document.getElementById('offlineScreen').style.display = 'none';
         initPlayer();
       }
     } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
   }, 5000);
-}
-
-// เรียกเมื่อ HLS.js ยืนยัน MANIFEST_PARSED = เล่นได้จริง → ค่อย stop poll
-function confirmHlsReady() {
-  if (workerPollInterval) {
-    clearInterval(workerPollInterval);
-    workerPollInterval = null;
-    hlsRetryCount = 0;
-    console.log('[TCC] HLS confirmed playing — poll stopped');
-  }
-}
-
-// เรียกเมื่อ HLS.js fatal error → restart poll ใหม่ (URL อาจเปลี่ยน หรือยัง 404)
-function restartWorkerPoll() {
-  hlsRetryCount++;
-  if (hlsRetryCount > HLS_RETRY_MAX) {
-    console.warn('[TCC] HLS retry limit reached — giving up');
-    return;
-  }
-  console.log(`[TCC] HLS fatal → restart poll (retry ${hlsRetryCount}/${HLS_RETRY_MAX})`);
-  // ถ้า poll หยุดอยู่ให้เริ่มใหม่
-  if (!workerPollInterval) {
-    startWorkerPoll();
-  }
-  // ถ้า poll ยังรัน → ปล่อย interval ทำงานต่อ (จะ call initPlayer ใน tick ถัดไป)
 }
 
 // ─────────────────────────────────────────
@@ -852,53 +841,59 @@ function initPlayer() {
     return;
   }
 
-  // destroy existing HLS instance before re-init (idempotent)
+  // หยุด poll ถ้า stream เริ่มได้แล้ว
+  if (workerPollInterval) {
+    clearInterval(workerPollInterval);
+    workerPollInterval = null;
+  }
+
+  // destroy existing HLS instance before re-init
   if (hlsInstance) {
     hlsInstance.destroy();
     hlsInstance = null;
   }
 
-  // ยังไม่ hide offline screen และยังไม่ set streamLive=true
-  // รอให้ MANIFEST_PARSED ยืนยันว่า .m3u8 โหลดสำเร็จก่อน
-  // (confirmHlsReady() จะ handle ทั้งสองอย่าง)
+  offline.style.display = 'none';
+  streamLive = true;
 
   if (Hls.isSupported()) {
-    hlsInstance = new Hls({
-      lowLatencyMode:       true,
-      manifestLoadingMaxRetry:    6,   // retry manifest 6 ครั้งก่อน fatal
-      manifestLoadingRetryDelay: 1000, // รอ 1s ระหว่าง retry
-      levelLoadingMaxRetry:       4,
-      fragLoadingMaxRetry:        4,
-    });
+    hlsInstance = new Hls({ lowLatencyMode: true });
     hlsInstance.loadSource(CONFIG.hlsUrl);
     hlsInstance.attachMedia(video);
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-      // .m3u8 โหลดสำเร็จ = stream พร้อมจริง → หยุด poll
-      confirmHlsReady();
-      streamLive = true;
-      offline.style.display = 'none';
-      video.play().catch(()=>{});
-    });
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); });
     hlsInstance.on(Hls.Events.ERROR, (e, data) => {
       if (data.fatal) {
+        // แก้ Bug #6: fatal error → destroy instance + restart poll อัตโนมัติ
+        // viewer ไม่ต้อง refresh เอง — รอ stream กลับมาแล้ว init ใหม่
         console.warn('[TCC] HLS fatal error:', data.type, data.details);
-        // destroy instance เก่าก่อน
-        hlsInstance.destroy();
-        hlsInstance = null;
+        offline.style.display = 'flex';
         streamLive = false;
-        // ไม่แสดง offline screen ทันที — รอให้ retry ก่อน
-        // แสดง offline เฉพาะถ้า retry หมดแล้ว
-        if (hlsRetryCount >= HLS_RETRY_MAX) {
-          offline.style.display = 'flex';
-        }
-        // restart poll → จะเรียก initPlayer ใน tick ถัดไป (~5s)
-        restartWorkerPoll();
+        // destroy HLS instance ก่อน (prevent memory leak)
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        // restart Worker poll เพื่อรอ stream กลับมา
+        // (อาจเกิดจาก tunnel restart หรือ ffmpeg restart)
+        console.log('[TCC] HLS fatal → restarting Worker poll in 5s...');
+        setTimeout(() => {
+          // ถ้า admin ยัง set isLive=true อยู่ → poll รอ URL ใหม่
+          // (Firebase listener จะ handle กรณี isLive=false เอง)
+          if (!streamLive && !workerPollInterval) {
+            console.log('[TCC] Restarting Worker poll after HLS fatal');
+            CONFIG.hlsUrl = ''; // reset URL → poll จะ init player ใหม่
+            // แสดง retry hint แทนข้อความ "รอเริ่ม Live"
+            const hint = document.getElementById('offlineRetryHint');
+            const title = document.getElementById('offlineTitle');
+            if (hint) hint.style.display = 'block';
+            if (title) title.textContent = 'Stream ขาดชั่วคราว';
+            startWorkerPoll();
+          }
+        }, 5000);
+      } else {
+        // non-fatal error → HLS.js handle เอง (retry internally)
+        console.warn('[TCC] HLS non-fatal:', data.type, data.details);
       }
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari native HLS
     video.src = CONFIG.hlsUrl;
-    video.addEventListener('canplay', confirmHlsReady, { once: true });
     video.play().catch(()=>{});
   }
 }
@@ -940,9 +935,10 @@ function initFirebase() {
       // isLive ถูก set เป็น false → ล้าง player แสดง offline screen
       if (d.isLive === false) {
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
-        // หยุด Worker poll ถ้า Admin หยุด live
+        // หยุด Worker poll ทั้งหมด — Admin หยุด live จริง ไม่ต้อง poll ต่อ
         if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
         streamLive = false;
+        CONFIG.hlsUrl = ''; // reset URL
         const offline = document.getElementById('offlineScreen');
         if (offline) offline.style.display = 'flex';
       }
@@ -974,14 +970,9 @@ function initFirebase() {
         // URL เปลี่ยน หรือเพิ่งได้รับครั้งแรก → (re-)init player
         const changed = CONFIG.hlsUrl !== info.hlsUrl;
         CONFIG.hlsUrl = info.hlsUrl;
-        // reset retry counter เมื่อได้ URL ใหม่จาก Firebase
-        hlsRetryCount = 0;
-        // หยุด Worker poll เฉพาะถ้า HLS เล่นได้แล้ว (streamLive=true)
-        // ถ้ายังไม่ได้เล่น → ปล่อย poll ทำงานต่อเพื่อ retry
-        if (streamLive && workerPollInterval) {
-          clearInterval(workerPollInterval);
-          workerPollInterval = null;
-        }
+        // Firebase ส่งมาแล้ว → หยุด Worker poll (ไม่ต้อง poll ซ้ำ)
+        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
+        // แสดง init player เฉพาะเมื่อ serverReady=true หรือ stream เคย live แล้ว
         if (changed || !streamLive) {
           initPlayer();
         }
