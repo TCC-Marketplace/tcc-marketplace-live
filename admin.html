@@ -376,17 +376,14 @@
       <button class="ctrl-btn btn-clear-chat" onclick="confirmClearChat()">🗑 ล้างแชท</button>
     </div>
 
-    <!-- RTMP Info -->
+    <!-- RTMP Info — ใช้ Browser Live (กด 📡) แทน RTMP ภายนอก -->
     <div class="rtmp-box">
-      <div class="rtmp-row">
-        <div class="rtmp-label">📡 RTMP Server URL</div>
-        <div class="rtmp-val-wrap">
-          <div class="rtmp-val" id="rtmpUrl">rtmp://YOUR_SERVER_IP/live</div>
-          <button class="copy-mini" onclick="copyText('rtmpUrl')">📋 Copy</button>
-        </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">
+        📡 ระบบใช้ <strong style="color:var(--accent);">Browser Live</strong> (กดปุ่ม 📡 ล่างขวา)
+        ไม่จำเป็นต้องตั้ง RTMP URL ภายนอก
       </div>
       <div class="rtmp-row" style="margin-bottom:0;">
-        <div class="rtmp-label">🔑 Stream Key</div>
+        <div class="rtmp-label">🔑 Stream Key (สำหรับ ffmpeg/OBS)</div>
         <div class="rtmp-val-wrap">
           <div class="rtmp-val" id="streamKey">stream_tcc_••••••••••</div>
           <button class="copy-mini" onclick="toggleKey()">👁 แสดง</button>
@@ -598,9 +595,13 @@
 // ─────────────────────────────────────────
 // CONFIG – แก้ตรงนี้
 // ─────────────────────────────────────────
+// ⚠️ SECURITY: adminSecret ใน code นี้เปิดเผยต่อทุกคนที่ view-source ได้
+// ควรโหลด secret จาก URL parameter หรือ prompt แทนการ hardcode
+// เช่น: const adminSecret = new URLSearchParams(location.search).get('s') || 'default'
 const ADMIN_CONFIG = {
   rtmpServer: 'rtmp://YOUR_SERVER_IP/live',
-  // ─── adminSecret ต้องตรงกับ ADMIN_SECRET ใน Cloudflare Worker env ───
+  // TODO: เปลี่ยนจาก hardcode → โหลดจาก ?s= URL parameter
+  // adminSecret: new URLSearchParams(location.search).get('s') || 'tcc2024secret'
   adminSecret: 'tcc2024secret',
   github: {
     // Token ถูกย้ายไปเก็บใน Cloudflare Worker แล้ว (ปลอดภัย)
@@ -711,17 +712,24 @@ function updateStats(d) {
   if (d.viewers !== undefined) document.getElementById('statViewers').textContent = d.viewers.toLocaleString();
   if (d.likes !== undefined) document.getElementById('statLikes').textContent = d.likes.toLocaleString();
   if (d.shares !== undefined) document.getElementById('statShares').textContent = d.shares.toLocaleString();
-  // simulate health bars when streaming
-  if (isStreaming) {
-    const br = 3200 + ~~(Math.random()*800);
-    const cpu = 35 + ~~(Math.random()*20);
-    const fd = ~~(Math.random()*3);
-    document.getElementById('bitrateVal').textContent = br + ' Kbps';
-    document.getElementById('bitrateBar').style.width = Math.min(br/6000*100,100) + '%';
-    document.getElementById('cpuVal').textContent = cpu + '%';
-    document.getElementById('cpuBar').style.width = cpu + '%';
-    document.getElementById('frameVal').textContent = fd + '%';
-    document.getElementById('frameBar').style.width = fd*10 + '%';
+  // health bars: แสดงเฉพาะตอน streaming จริง (ค่าเป็น estimated จาก MediaRecorder)
+  if (isStreaming && blRecorder) {
+    // ใช้ videoBitsPerSecond จาก MediaRecorder ถ้า browser รองรับ
+    const actualBr = (blRecorder.videoBitsPerSecond || 1500000) / 1000;
+    // CPU/FrameDrop ไม่มี API → แสดงเป็น estimated พร้อม label ชัดเจน
+    document.getElementById('bitrateVal').textContent = Math.round(actualBr) + ' Kbps';
+    document.getElementById('bitrateBar').style.width = Math.min(actualBr/3000*100,100) + '%';
+    document.getElementById('cpuVal').textContent = '~est';
+    document.getElementById('cpuBar').style.width = '40%';
+    document.getElementById('frameVal').textContent = '~est';
+    document.getElementById('frameBar').style.width = '5%';
+  } else if (!isStreaming) {
+    document.getElementById('bitrateVal').textContent = '0 Kbps';
+    document.getElementById('bitrateBar').style.width = '0%';
+    document.getElementById('cpuVal').textContent = '0%';
+    document.getElementById('cpuBar').style.width = '0%';
+    document.getElementById('frameVal').textContent = '0%';
+    document.getElementById('frameBar').style.width = '0%';
   }
 }
 
@@ -754,12 +762,16 @@ function endStream() {
   document.getElementById('streamDuration').textContent = '';
   document.getElementById('goLiveBtn').textContent = '🔴 เริ่ม Live';
   document.getElementById('goLiveBtn').classList.remove('streaming');
+  // แก้ Bug #9: endStream() เป็น single source of truth สำหรับ Firebase write
+  // blStopLive() จะ stop recorder/tracks แต่ไม่ write Firebase ซ้ำ
   if (db) {
     db.ref('liveStats/isLive').set(false);
+    db.ref('liveStats/serverReady').set(false);
     db.ref('streamInfo/hlsUrl').remove();
+    db.ref('streamInfo/serverReady').set(false);
   }
-  // ล้าง Browser Panel state ด้วย
-  if (typeof blStopLive === 'function') blStopLive();
+  // หยุด Browser Panel (media tracks) โดยไม่ให้ write Firebase ซ้ำ
+  if (typeof blStopLiveMediaOnly === 'function') blStopLiveMediaOnly();
   addLog('⏹ หยุด Live Stream แล้ว');
   showToast('⏹ หยุด Live แล้ว');
 }
@@ -1197,7 +1209,7 @@ function initShopAdmin() {
 }
 
 // ─── INIT ───
-document.getElementById('rtmpUrl').textContent = ADMIN_CONFIG.rtmpServer;
+// rtmpUrl element ถูกเปลี่ยนเป็น Browser Live panel แล้ว (ไม่มี id="rtmpUrl" ใน HTML)
 initFirebase();
 addLog('⚙️ Admin Panel เริ่มทำงาน');
 initShopAdmin();
@@ -1227,6 +1239,7 @@ initShopAdmin();
 .bl-btn-go:disabled { background:#444; cursor:not-allowed; }
 .bl-btn-stop { background:#ff3b30; color:#fff; display:none; }
 .bl-log { font-size:11px; color:#888; margin-top:6px; height:32px; overflow:hidden; }
+.bl-progress-step { font-size:10px; color:#ff2d55; font-weight:700; }
 #browserLiveToggle {
   position:fixed; bottom:16px; right:16px; z-index:10000;
   background:#ff2d55; color:#fff; border:none; border-radius:50%;
@@ -1258,6 +1271,16 @@ initShopAdmin();
     </div>
   </div>
   <div class="bl-log" id="blLog">กด "เริ่มไลฟ์" — กล้องจะเปิดอัตโนมัติ</div>
+  <!-- Progress bar: แสดงระหว่างรอ GitHub Actions ~2-3 นาที -->
+  <div id="blProgressWrap" style="display:none;margin-top:6px;">
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:3px;">
+      <span id="blProgressLabel">รอ server...</span>
+      <span id="blProgressPct">0%</span>
+    </div>
+    <div style="height:4px;background:#222;border-radius:2px;overflow:hidden;">
+      <div id="blProgressBar" style="height:100%;background:#ff2d55;border-radius:2px;width:0%;transition:width .5s;"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1374,18 +1397,46 @@ async function blTriggerGitHubActions() {
 function blPollForUrls() {
   const proxyUrl = ADMIN_CONFIG.github.proxyUrl.replace(/\/$/, '');
   let tries = 0;
-  const maxTries = 96;
+  const maxTries = 96;  // 96 × 5s = 8 นาที
+
+  // แสดง progress bar
+  const pw = document.getElementById('blProgressWrap');
+  if (pw) pw.style.display = 'block';
+
+  // ขั้นตอนที่แสดงบน progress bar ตาม elapsed time
+  const STEPS = [
+    { atSec: 0,   label: '⏳ รอ GitHub Actions boot...',   pct: 5  },
+    { atSec: 30,  label: '🚀 GitHub runner กำลังเริ่ม...', pct: 15 },
+    { atSec: 60,  label: '📦 ติดตั้ง dependencies...',     pct: 30 },
+    { atSec: 90,  label: '🎬 เริ่ม ffmpeg pipeline...',    pct: 50 },
+    { atSec: 120, label: '🌐 เปิด Cloudflare tunnel...',   pct: 70 },
+    { atSec: 150, label: '🔗 รอ tunnel URL พร้อม...',      pct: 85 },
+    { atSec: 180, label: '✅ เกือบพร้อมแล้ว...',           pct: 93 },
+  ];
 
   blPolling = setInterval(async () => {
     tries++;
     const elapsed = tries * 5;
     const remain  = Math.ceil((maxTries - tries) * 5 / 60);
-    blLog(`รอ server พร้อม... (${elapsed}s ผ่านไป | เหลือ ~${remain} นาที)`);
+
+    // อัปเดต progress bar ตาม elapsed time
+    const step = [...STEPS].reverse().find(s => elapsed >= s.atSec) || STEPS[0];
+    const pLabel = document.getElementById('blProgressLabel');
+    const pPct   = document.getElementById('blProgressPct');
+    const pBar   = document.getElementById('blProgressBar');
+    if (pLabel) pLabel.textContent = step.label;
+    if (pPct)   pPct.textContent   = step.pct + '%';
+    if (pBar)   pBar.style.width   = step.pct + '%';
+
+    blLog(`${step.label} (${elapsed}s | เหลือ ~${remain} นาที)`);
 
     if (tries > maxTries) {
       clearInterval(blPolling); blPolling = null;
-      blLog('หมดเวลารอ server — ลองกด Live ใหม่');
+      blLog('❌ หมดเวลารอ server — ลองกด Live ใหม่');
       blSetStatus('เกิดข้อผิดพลาด', '');
+      blIsTriggering = false;
+      const pWrap2 = document.getElementById('blProgressWrap');
+      if (pWrap2) pWrap2.style.display = 'none';
       blResetUI();
       return;
     }
@@ -1396,12 +1447,17 @@ function blPollForUrls() {
 
       if (data.ready && data.hls_url) {
         clearInterval(blPolling); blPolling = null;
+        blIsTriggering = false;
         blHlsUrl    = data.hls_url;
-        // ws_url field ถูกเปลี่ยนใช้เป็น HTTP ingest URL:
-        // format: https://xxx.trycloudflare.com/ingest
-        // (stream.yml เปลี่ยน WS_URL → INGEST_URL แล้ว)
         blIngestUrl = data.ws_url || data.ingest_url || null;
-        blLog('Server พร้อม! กำลังเริ่ม stream...');
+        // progress bar → 100% แล้วซ่อน
+        const pBar  = document.getElementById('blProgressBar');
+        const pPct  = document.getElementById('blProgressPct');
+        const pWrap = document.getElementById('blProgressWrap');
+        if (pBar)  { pBar.style.width = '100%'; pBar.style.background = '#30d158'; }
+        if (pPct)  pPct.textContent = '100%';
+        setTimeout(() => { if (pWrap) pWrap.style.display = 'none'; }, 1500);
+        blLog('✅ Server พร้อม! กำลังเริ่ม stream...');
         blSetStatus('กำลัง Live 🔴', 'live');
         blStartStreaming();
       }
@@ -1423,6 +1479,7 @@ const BL_MIME = (() => {
 // Queue สำหรับ chunks ที่รอส่ง
 let blChunkQueue  = [];
 let blChunkSender = null;  // interval สำหรับ drain queue
+let blIsTriggering = false; // guard: ป้องกัน double-trigger GitHub Actions
 
 function blStopRecorder() {
   if (blRecorder) {
@@ -1485,8 +1542,39 @@ function blStartStreaming() {
   blLog('🔴 กำลัง Live! (HTTP POST → ffmpeg → HLS)');
   blSetStatus('กำลัง Live 🔴', 'live');
 
-  // หลังส่ง stream ~10s → HLS ควรพร้อม → update Firebase
-  setTimeout(blActivateFirebase, 10000);
+  // แก้ Bug #8: ไม่รอ 10s fixed แต่ poll หา HLS segment แรกก่อน activate Firebase
+  // max wait 30s (6 × 5s) — ถ้ายังไม่มี segment ก็ activate ไปเลย (graceful fallback)
+  blWaitForHlsAndActivate();
+}
+
+// ── รอ HLS segment แรกก่อน activate Firebase ──────────────
+// แก้ Bug #8: รอ 10s fixed → อาจ activate ก่อน HLS พร้อม (viewer เห็น 404)
+// วิธีใหม่: GET blHlsUrl ทุก 5s จนได้ 200 แล้วค่อย activate (max 30s)
+async function blWaitForHlsAndActivate() {
+  if (!blHlsUrl) { blActivateFirebase(); return; }
+  const MAX_TRIES = 6;   // 6 × 5s = 30s
+  let tries = 0;
+
+  const poll = setInterval(async () => {
+    tries++;
+    try {
+      const res = await fetch(blHlsUrl, { method: 'HEAD', cache: 'no-store' });
+      if (res.ok) {
+        // HLS m3u8 ตอบ 200 → segment แรกพร้อมแล้ว
+        clearInterval(poll);
+        blLog('✅ HLS segment พร้อม → activate Firebase');
+        blActivateFirebase();
+        return;
+      }
+    } catch (_) {}
+
+    blLog(`⏳ รอ HLS segment... (${tries}/${MAX_TRIES})`);
+    if (tries >= MAX_TRIES) {
+      clearInterval(poll);
+      blLog('⚠️ HLS ยังไม่พร้อม — activate Firebase แบบ graceful');
+      blActivateFirebase();
+    }
+  }, 5000);
 }
 
 // ── อัปเดต Firebase → Viewer เห็นภาพ ─────────────────────
@@ -1523,6 +1611,11 @@ async function blActivateFirebase() {
 
 // ── ONE-BUTTON LIVE ────────────────────────────────────────
 async function blGoLive() {
+  // guard: ป้องกัน double-trigger ถ้ากด Live ซ้ำก่อน server พร้อม
+  if (blIsTriggering) {
+    blLog('⏳ กำลังรอ server อยู่ — กรุณารอสักครู่...');
+    return;
+  }
   if (!blStream) {
     blSetStatus('กำลังขอสิทธิ์กล้อง...', '');
     blLog('กำลังเปิดกล้อง...');
@@ -1541,18 +1634,20 @@ async function blGoLive() {
   document.getElementById('blStopBtn').style.display = 'inline-flex';
   blSetStatus('กำลังเริ่ม server...', 'live');
 
+  blIsTriggering = true;
   const triggered = await blTriggerGitHubActions();
-  if (!triggered) { blResetUI(); return; }
+  if (!triggered) { blIsTriggering = false; blResetUI(); return; }
 
   blPollForUrls();
 }
 
-// ── หยุด Live ──────────────────────────────────────────────
-function blStopLive() {
+// ── หยุดเฉพาะ media (เรียกจาก endStream เพื่อหลีกเลี่ยง Firebase write ซ้ำ) ──
+function blStopLiveMediaOnly() {
   blStopRecorder();
   if (blPolling) { clearInterval(blPolling); blPolling = null; }
   if (blChunkSender) { clearInterval(blChunkSender); blChunkSender = null; }
-  blChunkQueue = [];
+  blChunkQueue  = [];
+  blIsTriggering = false;
 
   if (blStream) { blStream.getTracks().forEach(t => t.stop()); blStream = null; }
   document.getElementById('blPreview').srcObject = null;
@@ -1561,11 +1656,29 @@ function blStopLive() {
 
   blResetUI();
   blLog('หยุด Live แล้ว');
+  // ไม่ write Firebase ที่นี่ — endStream() เป็นผู้ write
+}
 
+// ── หยุด Live (กดปุ่ม ■ บน panel โดยตรง — ไม่ผ่าน endStream) ──────
+function blStopLive() {
+  blStopLiveMediaOnly();
+  // กรณีกดหยุดจาก panel โดยตรง (ไม่ผ่าน endStream) → write Firebase เอง
   if (db) {
     db.ref('liveStats/isLive').set(false);
+    db.ref('liveStats/serverReady').set(false);
     db.ref('streamInfo/hlsUrl').remove();
+    db.ref('streamInfo/serverReady').set(false);
   }
+  // sync topbar UI
+  isStreaming = false;
+  clearInterval(streamTimer); streamTimer = null;
+  document.getElementById('statusDot').className = 'status-dot offline';
+  document.getElementById('statusText').textContent = 'Offline';
+  document.getElementById('streamDuration').textContent = '';
+  document.getElementById('goLiveBtn').textContent = '🔴 เริ่ม Live';
+  document.getElementById('goLiveBtn').classList.remove('streaming');
+  addLog('⏹ หยุด Live จาก Browser Panel');
+  showToast('⏹ หยุด Live แล้ว');
 }
 
 function blResetUI() {
@@ -1573,6 +1686,15 @@ function blResetUI() {
   document.getElementById('blGoBtn').style.display  = 'inline-flex';
   document.getElementById('blStopBtn').style.display = 'none';
   blSetStatus('พร้อมไลฟ์', '');
+  // reset progress bar
+  const pWrap = document.getElementById('blProgressWrap');
+  const pBar  = document.getElementById('blProgressBar');
+  const pPct  = document.getElementById('blProgressPct');
+  const pLbl  = document.getElementById('blProgressLabel');
+  if (pWrap) pWrap.style.display = 'none';
+  if (pBar)  { pBar.style.width = '0%'; pBar.style.background = '#ff2d55'; }
+  if (pPct)  pPct.textContent = '0%';
+  if (pLbl)  pLbl.textContent = 'รอ server...';
 }
 
 </script>
