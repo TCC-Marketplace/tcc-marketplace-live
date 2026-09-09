@@ -74,9 +74,9 @@ jobs:
             '' \
             '    # ── Video ingest (admin POST) ──────────────────────' \
             '    # Node.js ingest server รับ chunks → ffmpeg stdin (1 process)' \
-            '    # Fix: proxy_intercept_errors + named location @cors_502' \
-            '    #      เพื่อ inject CORS headers แม้ตอน upstream 502' \
-            '    #      (add_header ใน proxy location ไม่ inject ตอน error response)' \
+            '    # Fix CORS double-header: Node.js upstream ส่ง Access-Control-Allow-Origin: *' \
+            '    #   nginx add_header จะทำให้มี header ซ้อน "*, *" → browser บล็อก' \
+            '    #   แก้ด้วย proxy_hide_header ซ่อน upstream CORS headers ก่อน nginx เพิ่มของตัวเอง' \
             '    location /ingest {' \
             '      proxy_pass              http://127.0.0.1:9002;' \
             '      proxy_http_version      1.1;' \
@@ -85,11 +85,13 @@ jobs:
             '      proxy_read_timeout      3600s;' \
             '      proxy_send_timeout      3600s;' \
             '      client_max_body_size    0;' \
+            '      proxy_hide_header Access-Control-Allow-Origin;' \
+            '      proxy_hide_header Access-Control-Allow-Methods;' \
+            '      proxy_hide_header Access-Control-Allow-Headers;' \
             '      add_header Access-Control-Allow-Origin  "*" always;' \
             '      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
             '      if ($request_method = OPTIONS) { return 204; }' \
-            '      # Fix CORS on upstream error: intercept 502/503/504 → named location' \
             '      proxy_intercept_errors  on;' \
             '      error_page 502 503 504 = @ingest_error;' \
             '    }' \
@@ -104,10 +106,14 @@ jobs:
             '    }' \
             '' \
             '    # ── Ingest pipeline status (admin poll) ────────────' \
+            '    # Fix CORS double-header เช่นเดียวกับ /ingest' \
             '    location /ingest-status {' \
             '      proxy_pass              http://127.0.0.1:9002/status;' \
             '      proxy_http_version      1.1;' \
             '      proxy_read_timeout      5s;' \
+            '      proxy_hide_header Access-Control-Allow-Origin;' \
+            '      proxy_hide_header Access-Control-Allow-Methods;' \
+            '      proxy_hide_header Access-Control-Allow-Headers;' \
             '      add_header Access-Control-Allow-Origin  "*" always;' \
             '      add_header Access-Control-Allow-Methods "GET, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
@@ -193,7 +199,7 @@ jobs:
           echo "ffmpeg + ingest server pipeline ready"
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 5: Install Cloudflare Tunnel
+      # STEP 6: Install Cloudflare Tunnel
       # ─────────────────────────────────────────────────────────────
       - name: Install Cloudflare Tunnel
         run: |
@@ -203,7 +209,7 @@ jobs:
           ./cloudflared --version
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 6: Start tunnel → POST URLs to Worker → notify Firebase
+      # STEP 7: Start tunnel → POST URLs to Worker → notify Firebase
       # ─────────────────────────────────────────────────────────────
       - name: Start tunnel and POST URLs to Worker
         env:
@@ -223,28 +229,27 @@ jobs:
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
             > /tmp/cf_main.log 2>&1 &
           CF_PID=$!
-          echo "cloudflared PID=$CF_PID — waiting 45s..."
-          sleep 45
+          echo "cloudflared PID=$CF_PID"
 
           extract_url() {
             grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$1" | head -1
           }
 
-          CF_URL=$(extract_url /tmp/cf_main.log)
-          echo "=== cf_main.log (last 20 lines) ==="
-          tail -20 /tmp/cf_main.log || true
-          echo "Tunnel URL: $CF_URL"
-
-          if [ -z "$CF_URL" ]; then
-            echo "URL ยังไม่มา — รอเพิ่ม 30s..."
-            sleep 30
+          # Poll ทุก 2s แทน sleep 45s → URL มาเร็วแค่ไหนก็ได้ทันที (max 60s)
+          echo "Waiting for tunnel URL (max 60s)..."
+          CF_URL=""
+          for i in $(seq 1 30); do
             CF_URL=$(extract_url /tmp/cf_main.log)
-            echo "Retry URL: $CF_URL"
-          fi
+            if [ -n "$CF_URL" ]; then
+              echo "Tunnel URL ready after $((i * 2))s: $CF_URL"
+              break
+            fi
+            sleep 2
+          done
 
           if [ -z "$CF_URL" ]; then
-            echo "FATAL: ไม่พบ tunnel URL หลังรอ 75s"
-            cat /tmp/cf_main.log || true
+            echo "FATAL: ไม่พบ tunnel URL หลังรอ 60s"
+            tail -30 /tmp/cf_main.log || true
             kill $CF_PID 2>/dev/null || true
             exit 1
           fi
@@ -297,7 +302,7 @@ jobs:
           fi
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 7: Keep alive with watchdog
+      # STEP 8: Keep alive with watchdog
       # ─────────────────────────────────────────────────────────────
       - name: Keep alive (max 6 hours)
         run: |
