@@ -14,21 +14,25 @@ jobs:
 
     steps:
       # ─────────────────────────────────────────────────────────────
-      # STEP 1: Install all dependencies
+      # STEP 1: Install dependencies
       # ─────────────────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd
+          sudo apt-get install -y nginx libnginx-mod-rtmp ffmpeg netcat-openbsd socat
 
       # ─────────────────────────────────────────────────────────────
       # STEP 2: Write Nginx config
-      # Port 8080 ทำหน้าที่ 2 อย่าง:
-      #   /hls/   → serve HLS files จาก /tmp/hls
-      #   /ws     → proxy_pass WebSocket ไปยัง websocat:9001
-      # ทำไมต้อง Nginx proxy WebSocket แทน cloudflared direct:
-      #   cloudflared HTTP/2 upstream ไม่ compatible กับ websocat ws-l
-      #   Nginx จัดการ HTTP Upgrade header ก่อน → WebSocket ทำงานได้
+      #
+      # สำคัญ: เปลี่ยนจาก WebSocket → HTTP POST /ingest
+      # ปัญหาเดิม: cloudflared trycloudflare ไม่รองรับ WebSocket
+      #   "WebSocket is closed before the connection is established"
+      # แก้: Admin ส่ง video chunks ผ่าน HTTP POST /ingest (plain HTTP)
+      #   → ทำงานได้กับทุก HTTP tunnel รวมถึง cloudflared trycloudflare
+      #
+      # Port 8080 จัดการ 2 อย่าง:
+      #   /hls/   → serve HLS files (GET)
+      #   /ingest → รับ video data (POST) → named pipe → ffmpeg
       # ─────────────────────────────────────────────────────────────
       - name: Write Nginx config
         run: |
@@ -58,7 +62,9 @@ jobs:
             '' \
             '  server {' \
             '    listen 8080;' \
+            '    client_max_body_size 0;' \
             '' \
+            '    # ── HLS files (viewer GET) ─────────────────────────' \
             '    location /hls {' \
             '      types { application/vnd.apple.mpegurl m3u8; video/mp2t ts; }' \
             '      root /tmp;' \
@@ -69,17 +75,22 @@ jobs:
             '      if ($request_method = OPTIONS) { return 204; }' \
             '    }' \
             '' \
-            '    location /ws {' \
-            '      proxy_pass         http://127.0.0.1:9001;' \
+            '    # ── Video ingest (admin POST) ──────────────────────' \
+            '    # Admin ส่ง Blob chunks ผ่าน HTTP POST /ingest' \
+            '    # Nginx proxy_pass ไปยัง socat port 9002' \
+            '    # socat pipe ไปยัง ffmpeg stdin' \
+            '    location /ingest {' \
+            '      proxy_pass         http://127.0.0.1:9002;' \
             '      proxy_http_version 1.1;' \
-            '      proxy_set_header   Upgrade    $http_upgrade;' \
-            '      proxy_set_header   Connection "upgrade";' \
-            '      proxy_set_header   Host       $host;' \
+            '      proxy_request_buffering off;' \
+            '      proxy_buffering    off;' \
             '      proxy_read_timeout 3600s;' \
             '      proxy_send_timeout 3600s;' \
+            '      client_max_body_size 0;' \
             '      add_header Access-Control-Allow-Origin  "*" always;' \
-            '      add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;' \
+            '      add_header Access-Control-Allow-Methods "POST, OPTIONS" always;' \
             '      add_header Access-Control-Allow-Headers "*" always;' \
+            '      if ($request_method = OPTIONS) { return 204; }' \
             '    }' \
             '' \
             '    location / {' \
@@ -95,7 +106,7 @@ jobs:
 
           sudo mkdir -p /tmp/hls
           sudo chmod 777 /tmp/hls
-          echo "nginx.conf written OK"
+          echo "nginx.conf written"
 
       # ─────────────────────────────────────────────────────────────
       # STEP 3: Test and start Nginx
@@ -107,74 +118,59 @@ jobs:
           nc -z 127.0.0.1 8080 && echo "Port 8080: READY" || echo "Port 8080: NOT READY"
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 4: Install websocat
-      # ─────────────────────────────────────────────────────────────
-      - name: Install websocat
-        run: |
-          curl -sL https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl \
-            -o websocat
-          chmod +x websocat
-          ./websocat --version
-
-      # ─────────────────────────────────────────────────────────────
-      # STEP 5: Start WebSocket ingestion
+      # STEP 4: Start ffmpeg ingestion pipeline
       #
-      # ⚠️  ทำไมไม่ใช้ --oneshot:
-      #   MediaRecorder ส่ง WebM EBML header (init segment) แค่ตอน .start() เท่านั้น
-      #   ถ้าใช้ --oneshot → ffmpeg spawn ใหม่ทุก connection → ไม่มี EBML header
-      #   → ffmpeg: "Invalid data" → ไม่เขียน .m3u8 → viewer เห็น 404 ตลอด
+      # Pipeline:
+      #   Admin browser → POST /ingest (HTTP)
+      #   → Nginx proxy → port 9002 (socat)
+      #   → socat TCP-LISTEN:9002 → named pipe /tmp/video_pipe
+      #   → ffmpeg รับจาก /tmp/video_pipe → H.264/AAC → RTMP
+      #   → Nginx RTMP → HLS files /tmp/hls/stream_tcc.m3u8
       #
-      # แนวทาง:
-      #   websocat ไม่มี --oneshot → listen port 9001 ตลอด (multi-connection)
-      #   ทุก connection ใหม่ → ffmpeg process ใหม่
-      #   admin.html ต้อง: เมื่อ WebSocket reconnect → stop MediaRecorder → start() ใหม่
-      #   → ส่ง EBML header ใหม่ไปยัง ffmpeg ใหม่ทุกครั้ง ✅
+      # ทำไมใช้ socat + named pipe แทน websocat:
+      #   - HTTP POST ไม่ต้องการ WebSocket protocol
+      #   - socat รับ TCP connection → เขียนลง pipe โดยตรง
+      #   - ทุก POST request = chunk ใหม่ที่ต่อเนื่องกัน
       # ─────────────────────────────────────────────────────────────
-      - name: Start WebSocket ingestion
+      - name: Start ffmpeg pipeline
         run: |
           STREAM_KEY="${{ github.event.inputs.stream_key }}"
 
-          # websocat รับ WebSocket → pipe ไป ffmpeg
-          # ไม่ใช้ --oneshot: ทุก connection ใหม่ spawn ffmpeg ใหม่
-          # admin.html จะ restart MediaRecorder ทุกครั้งที่ reconnect
-          # ทำให้ ffmpeg ได้รับ EBML header ครบทุกครั้ง
-          ./websocat \
-            --binary \
-            -U \
-            ws-l:127.0.0.1:9001 \
-            sh-c:"ffmpeg -hide_banner -loglevel warning \
-              -f webm -i pipe:0 \
-              -c:v libx264 -preset ultrafast -tune zerolatency \
-              -x264-params keyint=60:min-keyint=60:scenecut=0 \
-              -c:a aac -ar 44100 -b:a 128k \
-              -f flv rtmp://127.0.0.1/live/${STREAM_KEY}" \
-            >> /tmp/ffmpeg.log 2>&1 &
-          WS_PID=$!
-          echo "websocat PID=$WS_PID"
+          # สร้าง named pipe สำหรับส่ง data ระหว่าง socat → ffmpeg
+          mkfifo /tmp/video_pipe
 
-          # รอ port 9001 พร้อม (max 20s)
-          echo "Waiting for port 9001..."
-          READY=0
-          for i in $(seq 1 20); do
-            if nc -z 127.0.0.1 9001 2>/dev/null; then
-              echo "Port 9001 READY after ${i}s"
-              READY=1
+          # ffmpeg อ่านจาก named pipe → RTMP (background)
+          ffmpeg -hide_banner -loglevel warning \
+            -f webm -i /tmp/video_pipe \
+            -c:v libx264 -preset ultrafast -tune zerolatency \
+            -x264-params keyint=60:min-keyint=60:scenecut=0 \
+            -c:a aac -ar 44100 -b:a 128k \
+            -f flv "rtmp://127.0.0.1/live/${STREAM_KEY}" \
+            > /tmp/ffmpeg.log 2>&1 &
+          FFMPEG_PID=$!
+          echo "ffmpeg PID=$FFMPEG_PID"
+
+          # socat รับ TCP port 9002 → เขียนลง named pipe
+          # fork: รับ connection ใหม่ได้เรื่อยๆ (ทุก POST request)
+          socat TCP-LISTEN:9002,fork,reuseaddr - > /tmp/video_pipe &
+          SOCAT_PID=$!
+          echo "socat PID=$SOCAT_PID"
+
+          # รอ port 9002 พร้อม (max 15s)
+          echo "Waiting for port 9002..."
+          for i in $(seq 1 15); do
+            if nc -z 127.0.0.1 9002 2>/dev/null; then
+              echo "Port 9002 READY after ${i}s"
               break
             fi
             sleep 1
           done
 
-          if [ "$READY" = "0" ]; then
-            echo "ERROR: port 9001 not ready after 20s"
-            cat /tmp/ffmpeg.log || true
-            kill $WS_PID 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "WebSocket ingestion ready"
+          nc -z 127.0.0.1 9002 || { echo "ERROR: port 9002 not ready"; exit 1; }
+          echo "ffmpeg pipeline ready"
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 6: Install Cloudflare Tunnel
+      # STEP 5: Install Cloudflare Tunnel
       # ─────────────────────────────────────────────────────────────
       - name: Install Cloudflare Tunnel
         run: |
@@ -184,10 +180,12 @@ jobs:
           ./cloudflared --version
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 7: Start single tunnel and POST URLs to Worker
-      # tunnel เดียว port 8080 → Nginx จัดการทั้ง HLS และ WebSocket
-      # HLS URL: https://xxx.trycloudflare.com/hls/STREAM_KEY.m3u8
-      # WS URL:  wss://xxx.trycloudflare.com/ws
+      # STEP 6: Start tunnel and POST URLs to Worker
+      #
+      # URL ที่ส่งไปยัง Worker KV:
+      #   hls_url: https://xxx.trycloudflare.com/hls/stream_tcc.m3u8
+      #   ws_url:  https://xxx.trycloudflare.com/ingest  ← HTTP POST endpoint
+      #            (ใช้ field ws_url เดิม เพื่อให้ Worker ไม่ต้องแก้)
       # ─────────────────────────────────────────────────────────────
       - name: Start tunnel and POST URLs to Worker
         env:
@@ -232,23 +230,25 @@ jobs:
           fi
 
           HLS_URL="${CF_URL}/hls/${STREAM_KEY}.m3u8"
-          WS_URL="$(echo "$CF_URL" | sed 's/https:/wss:/')/ws"
+          # ส่ง HTTP ingest URL ใน field ws_url (Worker ไม่ต้องแก้)
+          INGEST_URL="${CF_URL}/ingest"
 
-          echo "HLS_URL = $HLS_URL"
-          echo "WS_URL  = $WS_URL"
+          echo "HLS_URL    = $HLS_URL"
+          echo "INGEST_URL = $INGEST_URL"
 
           # ตรวจ service health
-          echo "=== Service health check ==="
-          nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx):    OK" || echo "Port 8080: DOWN ⚠️"
-          nc -z 127.0.0.1 9001 && echo "Port 9001 (websocat): OK" || echo "Port 9001: DOWN ⚠️"
-          nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):     OK" || echo "Port 1935: DOWN ⚠️"
+          echo "=== Service health ==="
+          nc -z 127.0.0.1 8080 && echo "Port 8080 (Nginx):  OK" || echo "Port 8080: DOWN ⚠️"
+          nc -z 127.0.0.1 9002 && echo "Port 9002 (socat):  OK" || echo "Port 9002: DOWN ⚠️"
+          nc -z 127.0.0.1 1935 && echo "Port 1935 (RTMP):   OK" || echo "Port 1935: DOWN ⚠️"
 
           # POST URLs → Worker KV
+          # ส่ง ingest_url ใน field ws_url (admin.html อ่าน data.ws_url → blIngestUrl)
           HTTP_STATUS=$(curl -s -o /tmp/worker_res.txt -w "%{http_code}" \
             -X POST "${WORKER_URL}/hls-url" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Secret: ${ADMIN_SECRET}" \
-            -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${WS_URL}\"}")
+            -d "{\"hls_url\": \"${HLS_URL}\", \"ws_url\": \"${INGEST_URL}\"}")
 
           echo "Worker HTTP: $HTTP_STATUS"
           cat /tmp/worker_res.txt
@@ -262,8 +262,7 @@ jobs:
           fi
 
       # ─────────────────────────────────────────────────────────────
-      # STEP 8: Keep alive with watchdog
-      # ตรวจทุก 10 นาที: restart websocat และ nginx ถ้า port ตาย
+      # STEP 7: Keep alive with watchdog
       # ─────────────────────────────────────────────────────────────
       - name: Keep alive (max 6 hours)
         run: |
@@ -274,32 +273,23 @@ jobs:
             sleep 30
 
             if [ $((i % 20)) -eq 0 ]; then
-              ELAPSED_MIN=$((i/2))
-              echo "=== ${ELAPSED_MIN} min elapsed ==="
+              echo "=== $((i/2)) min elapsed ==="
               tail -5 /tmp/ffmpeg.log 2>/dev/null || true
 
-              # watchdog: restart websocat ถ้า port 9001 down
-              if ! nc -z 127.0.0.1 9001 2>/dev/null; then
-                echo "⚠️ port 9001 down — restarting websocat..."
-                ./websocat \
-                  --binary -U \
-                  ws-l:127.0.0.1:9001 \
-                  sh-c:"ffmpeg -hide_banner -loglevel warning \
-                    -f webm -i pipe:0 \
-                    -c:v libx264 -preset ultrafast -tune zerolatency \
-                    -x264-params keyint=60:min-keyint=60:scenecut=0 \
-                    -c:a aac -ar 44100 -b:a 128k \
-                    -f flv rtmp://127.0.0.1/live/${STREAM_KEY}" \
-                  >> /tmp/ffmpeg.log 2>&1 &
-                sleep 3
-                nc -z 127.0.0.1 9001 && echo "✅ port 9001 recovered" || echo "❌ port 9001 still down"
+              # watchdog: restart socat ถ้า port 9002 down
+              if ! nc -z 127.0.0.1 9002 2>/dev/null; then
+                echo "⚠️ port 9002 down — restarting socat..."
+                socat TCP-LISTEN:9002,fork,reuseaddr - > /tmp/video_pipe &
+                sleep 2
+                nc -z 127.0.0.1 9002 && echo "✅ port 9002 recovered" || echo "❌ still down"
               fi
 
+              # watchdog: restart nginx ถ้า port 8080 down
               if ! nc -z 127.0.0.1 8080 2>/dev/null; then
                 echo "⚠️ port 8080 down — restarting nginx..."
                 sudo nginx
                 sleep 2
-                nc -z 127.0.0.1 8080 && echo "✅ port 8080 recovered" || echo "❌ port 8080 still down"
+                nc -z 127.0.0.1 8080 && echo "✅ port 8080 recovered" || echo "❌ still down"
               fi
             fi
           done
