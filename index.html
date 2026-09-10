@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>🔴 LIVE – TCC Marketplace</title>
 <link rel="icon" href="data:,">
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <style>
@@ -750,16 +749,15 @@
 
 <script>
 // ─────────────────────────────────────────
-// CONFIG – แก้ตรงนี้
+// CONFIG — TikTok-style WebRTC playback (WHEP)
 // ─────────────────────────────────────────
 const CONFIG = {
-  hlsUrl: '',            // ใส่ .m3u8 URL เช่น http://YOUR_SERVER/live/stream.m3u8
+  whepUrl: '',
   workerUrl: 'https://tcc-marketplace-live.tcc-team-developer.workers.dev',
   streamTitle: '📊 วิเคราะห์ตลาดคริปโต Live – TCC Marketplace',
-  streamSub: 'เริ่ม 14:00 น. | BTC ETH BNB วิเคราะห์เทคนิค',
+  streamSub: 'Live แบบ Real-time',
   shareUrl: window.location.href,
   myName: 'ผู้ชม_' + Math.floor(Math.random()*9000+1000),
-  // Firebase config (ใส่ค่าจาก Firebase console)
   firebase: {
     apiKey: "AIzaSyBFqcnFYx81XH3XLQ4QuAe6AP7C334jC38",
     authDomain: "tcc-marketplace-live.firebaseapp.com",
@@ -771,145 +769,89 @@ const CONFIG = {
     measurementId: "G-48QHXSQ4EH"
   }
 };
+let liked=false, followed=false, selectedGift=null, chatCount=0, likeCount=4821, shareCount=312, muted=true, db=null, streamLive=false;
+let whepPc=null, whepSessionUrl=null, workerPollInterval=null, liveStatusTimer=null;
+const WORKER_URL=CONFIG.workerUrl;
 
-// ─────────────────────────────────────────
-// STATE
-// ─────────────────────────────────────────
-let liked = false;
-let followed = false;
-let selectedGift = null;
-let chatCount = 0;
-let likeCount = 4821;
-let shareCount = 312;
-let muted = true;
-let db = null;
-let streamLive = false;
-let hlsInstance = null; // track HLS instance for clean re-init
-
-// ─────────────────────────────────────────
-// WORKER POLL FALLBACK
-// ถ้า Firebase ไม่ส่ง hlsUrl มา → poll Worker โดยตรง
-// ─────────────────────────────────────────
-const WORKER_URL = CONFIG.workerUrl;
-let workerPollInterval = null;
-
-function startWorkerPoll() {
-  if (workerPollInterval) return; // ไม่ poll ซ้ำ
-  console.log('[TCC] Worker poll started...');
-  let pollTries = 0;
-  const MAX_POLL_TRIES = 120; // 120 × 5s = 10 นาที
-
-  workerPollInterval = setInterval(async () => {
-    pollTries++;
-    // timeout: ถ้า poll เกิน 10 นาทียังไม่ได้ → หยุด (ประหยัด request)
-    if (pollTries > MAX_POLL_TRIES) {
-      clearInterval(workerPollInterval);
-      workerPollInterval = null;
-      console.log('[TCC] Worker poll timeout after 10 min');
-      return;
-    }
-    try {
-      const res  = await fetch(WORKER_URL + '/hls-url', { cache: 'no-store' });
-      const data = await res.json();
-      if (data.ready && data.hls_url) {
-        clearInterval(workerPollInterval);
-        workerPollInterval = null;
-        CONFIG.hlsUrl = data.hls_url;
-        console.log('[TCC] Worker poll: HLS ready → initPlayer');
-        // reset retry hint
-        const hint = document.getElementById('offlineRetryHint');
-        const title = document.getElementById('offlineTitle');
-        if (hint) hint.style.display = 'none';
-        if (title) title.textContent = 'รอเริ่ม Live...';
-        document.getElementById('offlineScreen').style.display = 'none';
-        initPlayer();
+function showOffline(msg='รอเริ่ม Live...'){
+  const o=document.getElementById('offlineScreen');
+  const t=document.getElementById('offlineTitle');
+  if(t) t.textContent=msg;
+  if(o) o.style.display='flex';
+}
+function hideOffline(){const o=document.getElementById('offlineScreen');if(o)o.style.display='none';}
+async function loadLiveConfig(){
+  try{const r=await fetch(WORKER_URL+'/live/config',{cache:'no-store'});const d=await r.json();if(d.ok&&d.live&&d.whep_url){CONFIG.whepUrl=d.whep_url;return d;} }catch(_){ }
+  return null;
+}
+function waitIceGatheringComplete(pc,timeout=3000){
+  if(pc.iceGatheringState==='complete') return Promise.resolve();
+  return new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;pc.removeEventListener('icegatheringstatechange',check);resolve();};const check=()=>{if(pc.iceGatheringState==='complete')finish();};pc.addEventListener('icegatheringstatechange',check);setTimeout(finish,timeout);});
+}
+async function destroyWhep(){
+  if(whepSessionUrl){try{await fetch(whepSessionUrl,{method:'DELETE'});}catch(_){} }
+  whepSessionUrl=null;
+  if(whepPc){try{whepPc.close();}catch(_){} whepPc=null;}
+  streamLive=false;
+}
+async function initPlayer(){
+  if(!CONFIG.whepUrl){
+    const cfg=await loadLiveConfig();
+    if(!cfg){showOffline('รอเริ่ม Live...');return;}
+  }
+  await destroyWhep();
+  const video=document.getElementById('liveVideo');
+  if(!video||!CONFIG.whepUrl){showOffline('รอเริ่ม Live...');return;}
+  try{
+    const pc=new RTCPeerConnection(); whepPc=pc;
+    pc.addTransceiver('video',{direction:'recvonly'}); pc.addTransceiver('audio',{direction:'recvonly'});
+    const remote=new MediaStream(); video.srcObject=remote; video.muted=muted;
+    pc.ontrack=e=>{if(e.streams?.[0]){e.streams[0].getTracks().forEach(t=>{if(!remote.getTracks().some(x=>x.id===t.id))remote.addTrack(t);});}else remote.addTrack(e.track); video.play().catch(()=>{});};
+    pc.onconnectionstatechange=()=>{
+      if(pc.connectionState==='connected'){streamLive=true;hideOffline();video.play().catch(()=>{});}
+      if(['failed','disconnected','closed'].includes(pc.connectionState)&&streamLive!==false){
+        streamLive=false;
+        showOffline('Stream ขาดชั่วคราว...');
+        const retryHint=document.getElementById('offlineRetryHint');
+        if(retryHint) retryHint.style.display='block';
+        // รอ 2 วิ แล้ว poll Worker ใหม่ (อาจ reconnect ได้)
+        setTimeout(()=>{ if(!workerPollInterval) startWorkerPoll(); },2000);
       }
-    } catch (_) { /* network hiccup — รอ interval ต่อไป */ }
-  }, 5000);
+    };
+    const offer=await pc.createOffer(); await pc.setLocalDescription(offer); await waitIceGatheringComplete(pc);
+    const res=await fetch(CONFIG.whepUrl,{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+    if(!res.ok) throw new Error('WHEP HTTP '+res.status);
+    const answer=await res.text(); await pc.setRemoteDescription({type:'answer',sdp:answer});
+    const loc=res.headers.get('Location'); if(loc) whepSessionUrl=new URL(loc,CONFIG.whepUrl).toString();
+    hideOffline();
+  }catch(e){console.warn('[TCC] WHEP error',e);await destroyWhep();showOffline('กำลังเชื่อมต่อ Live...');startWorkerPoll();}
 }
-
-// ─────────────────────────────────────────
-// HLS PLAYER
-// ─────────────────────────────────────────
-function initPlayer() {
-  const video = document.getElementById('liveVideo');
-  const offline = document.getElementById('offlineScreen');
-
-  if (!CONFIG.hlsUrl) {
-    offline.style.display = 'flex';
-    // เริ่ม poll Worker เพื่อรอ stream (fallback กรณี Firebase ช้า)
-    startWorkerPoll();
-    return;
-  }
-
-  // หยุด poll ถ้า stream เริ่มได้แล้ว
-  if (workerPollInterval) {
-    clearInterval(workerPollInterval);
-    workerPollInterval = null;
-  }
-
-  // destroy existing HLS instance before re-init
-  if (hlsInstance) {
-    hlsInstance.destroy();
-    hlsInstance = null;
-  }
-
-  offline.style.display = 'none';
-  streamLive = true;
-
-  if (Hls.isSupported()) {
-    hlsInstance = new Hls({ lowLatencyMode: true });
-    hlsInstance.loadSource(CONFIG.hlsUrl);
-    hlsInstance.attachMedia(video);
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); });
-    hlsInstance.on(Hls.Events.ERROR, (e, data) => {
-      if (data.fatal) {
-        // แก้ Bug #6: fatal error → destroy instance + restart poll อัตโนมัติ
-        // viewer ไม่ต้อง refresh เอง — รอ stream กลับมาแล้ว init ใหม่
-        console.warn('[TCC] HLS fatal error:', data.type, data.details);
-        offline.style.display = 'flex';
-        streamLive = false;
-        // destroy HLS instance ก่อน (prevent memory leak)
-        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
-        // restart Worker poll เพื่อรอ stream กลับมา
-        // (อาจเกิดจาก tunnel restart หรือ ffmpeg restart)
-        console.log('[TCC] HLS fatal → restarting Worker poll in 5s...');
-        setTimeout(() => {
-          // ถ้า admin ยัง set isLive=true อยู่ → poll รอ URL ใหม่
-          // (Firebase listener จะ handle กรณี isLive=false เอง)
-          if (!streamLive && !workerPollInterval) {
-            console.log('[TCC] Restarting Worker poll after HLS fatal');
-            CONFIG.hlsUrl = ''; // reset URL → poll จะ init player ใหม่
-            // แสดง retry hint แทนข้อความ "รอเริ่ม Live"
-            const hint = document.getElementById('offlineRetryHint');
-            const title = document.getElementById('offlineTitle');
-            if (hint) hint.style.display = 'block';
-            if (title) title.textContent = 'Stream ขาดชั่วคราว';
-            startWorkerPoll();
-          }
-        }, 5000);
-      } else {
-        // non-fatal error → HLS.js handle เอง (retry internally)
-        console.warn('[TCC] HLS non-fatal:', data.type, data.details);
+function startWorkerPoll(){
+  if(workerPollInterval)return;
+  let busy=false;
+  workerPollInterval=setInterval(async()=>{
+    if(busy)return;busy=true;
+    try{const cfg=await loadLiveConfig();if(cfg?.whep_url){clearInterval(workerPollInterval);workerPollInterval=null;await initPlayer();}}
+    finally{busy=false;}
+  },2000);
+}
+function startLiveStatusPoll(){
+  if(liveStatusTimer)return;
+  liveStatusTimer=setInterval(async()=>{
+    try{
+      const r=await fetch(WORKER_URL+'/live/status',{cache:'no-store'});const d=await r.json();
+      if(d.ok&&!d.live&&streamLive){
+        await destroyWhep();
+        CONFIG.whepUrl='';
+        showOffline('Live จบแล้ว');
+        // รีสตาร์ท poll รอ Live รอบต่อไป
+        if(!workerPollInterval) startWorkerPoll();
       }
-    });
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = CONFIG.hlsUrl;
-    video.play().catch(()=>{});
-  }
+    }catch(_){ }
+  },5000);
 }
-
-function toggleMute() {
-  const v = document.getElementById('liveVideo');
-  muted = !muted; v.muted = muted;
-  document.querySelector('.quality-btn').textContent = muted ? '🔇' : '🔊';
-}
-
-function toggleFullscreen() {
-  const wrap = document.getElementById('playerWrap');
-  if (!document.fullscreenElement) wrap.requestFullscreen();
-  else document.exitFullscreen();
-}
+function toggleMute(){const v=document.getElementById('liveVideo');muted=!muted;v.muted=muted;document.querySelector('.quality-btn').textContent=muted?'🔇':'🔊';}
+function toggleFullscreen(){const w=document.getElementById('playerWrap');if(!document.fullscreenElement)w.requestFullscreen();else document.exitFullscreen();}
 
 // ─────────────────────────────────────────
 // FIREBASE CHAT
@@ -933,28 +875,29 @@ function initFirebase() {
       if (d.viewers !== undefined) {
         document.getElementById('viewerCount').textContent = d.viewers.toLocaleString();
       }
-      // isLive ถูก set เป็น false → ล้าง player แสดง offline screen
+      // isLive=false → ล้าง player แสดง offline และเริ่ม poll ใหม่รอ Live รอบต่อไป
       if (d.isLive === false) {
-        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
-        // หยุด Worker poll ทั้งหมด — Admin หยุด live จริง ไม่ต้อง poll ต่อ
-        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
+        destroyWhep();
         streamLive = false;
-        CONFIG.hlsUrl = ''; // reset URL
+        CONFIG.whepUrl = '';
         const offline = document.getElementById('offlineScreen');
-        if (offline) offline.style.display = 'flex';
+        if (offline) { offline.style.display = 'flex'; document.getElementById('offlineTitle').textContent = 'Live จบแล้ว'; }
+        // ไม่ kill poll ถาวร — รีสตาร์ทเพื่อรอ Live รอบต่อไปโดยอัตโนมัติ
+        if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
+        startWorkerPoll();
       }
-      // isLive ถูก set เป็น true → ถ้ามี hlsUrl ใน CONFIG ให้ init player
-      // (กรณีที่ viewer โหลดหน้าหลัง Admin กด Live แล้ว แต่ streamInfo มาถึงก่อน)
-      if (d.isLive === true && CONFIG.hlsUrl && !streamLive) {
+      // isLive=true → เริ่ม player (ดึง WHEP URL จาก streamInfo listener ด้านล่าง)
+      if (d.isLive === true && !streamLive) {
         const offline = document.getElementById('offlineScreen');
         if (offline) offline.style.display = 'none';
-        initPlayer();
+        // CONFIG.whepUrl อาจถูก set แล้วโดย streamInfo listener ที่มาก่อน
+        if (CONFIG.whepUrl) initPlayer();
       }
     });
 
-    // ── streamInfo: hlsUrl + title + desc ────────────────
+    // ── streamInfo: whepUrl + title + desc ────────────────
     // Admin set streamInfo ก่อน isLive=true เสมอ (ดู startStream fix)
-    // Viewer จะได้รับ hlsUrl ทันทีที่ isLive event มาถึง
+    // Viewer จะเริ่ม WHEP เมื่อ state=live / isLive=true เท่านั้น
     db.ref('streamInfo').on('value', snap => {
       const info = snap.val() || {};
 
@@ -967,23 +910,27 @@ function initFirebase() {
         if (el) el.textContent = info.desc;
       }
 
-      if (info.hlsUrl) {
-        // URL เปลี่ยน หรือเพิ่งได้รับครั้งแรก → (re-)init player
-        const changed = CONFIG.hlsUrl !== info.hlsUrl;
-        CONFIG.hlsUrl = info.hlsUrl;
+      if (info.whepUrl && info.state === 'live') {
+        // URL เปลี่ยน หรือ stream กลับมา live → (re-)init player
+        const changed = CONFIG.whepUrl !== info.whepUrl;
+        CONFIG.whepUrl = info.whepUrl;
         // Firebase ส่งมาแล้ว → หยุด Worker poll (ไม่ต้อง poll ซ้ำ)
         if (workerPollInterval) { clearInterval(workerPollInterval); workerPollInterval = null; }
         // แสดง init player เฉพาะเมื่อ serverReady=true หรือ stream เคย live แล้ว
         if (changed || !streamLive) {
           initPlayer();
         }
-      } else if (info.hlsUrl === null || info.hlsUrl === undefined) {
-        // Admin remove hlsUrl (endStream) → แสดง offline screen
-        CONFIG.hlsUrl = '';
-        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+      } else if (info.whepUrl === null || info.whepUrl === undefined) {
+        // Worker /live/stop PUT null → viewer offline screen ทันที
+        CONFIG.whepUrl = '';
+        destroyWhep();
         streamLive = false;
         const offline = document.getElementById('offlineScreen');
-        if (offline) offline.style.display = 'flex';
+        if (offline) { offline.style.display = 'flex'; }
+        const t = document.getElementById('offlineTitle');
+        if (t && t.textContent !== 'รอเริ่ม Live...') t.textContent = 'Live จบแล้ว';
+        // รีสตาร์ท poll เพื่อรอ Live รอบต่อไป
+        if (!workerPollInterval) startWorkerPoll();
       }
     });
 
@@ -1631,7 +1578,8 @@ initPlayer();
 initFirebase();
 renderProductStrip();
 // เริ่ม Worker poll ทันทีถ้ายังไม่มี hlsUrl (ไม่รอ Firebase)
-if (!CONFIG.hlsUrl) startWorkerPoll();
+if (!CONFIG.whepUrl) startWorkerPoll();
+startLiveStatusPoll();
 // initShopFirebase() จะถูกเรียกหลัง initFirebase() สร้าง db
 </script>
 </body>
